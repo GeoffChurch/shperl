@@ -66,8 +66,9 @@ my @NORMAL_BINDINGS = (
     ]},
 );
 
-my @CREATE_HINTS       = ( [ 'ret', 'create'  ], [ 'esc', 'cancel' ] );
-my @CONFIRM_KILL_HINTS = ( [ 'y',   'confirm' ], [ 'n',   'cancel' ] );
+my @CREATE_HINTS        = ( [ 'ret', 'create'  ], [ 'esc', 'cancel' ] );
+my @CONFIRM_KILL_HINTS  = ( [ 'y',   'confirm' ], [ 'n',   'cancel' ] );
+my @CONFIRM_FORCE_HINTS = ( [ 'y',   'force'   ], [ 'n',   'cancel' ] );
 
 # Precomputed dispatch tables built once from @NORMAL_BINDINGS.
 my (%BYTE_KEY, %CSI_KEY);
@@ -136,8 +137,8 @@ sub model_new {
     return {
         sessions     => [],
         selected     => 0,
-        mode         => 'normal',    # normal | create | kill
-        mode_data    => '',          # create: partial name; kill: target name
+        mode         => 'normal',    # normal | create | kill | confirm_force
+        mode_data    => '',          # create: partial name; kill/confirm_force: target name
         error        => undef,
         parser_state => 'normal',    # normal | esc | esc_bracket
     };
@@ -237,9 +238,10 @@ sub process_input {
     my ($buf, $m) = @_;
     $m->{error} = undef;
     my $tokens = parse_tokens($m, $buf);
-    return process_normal($tokens, $m)        if $m->{mode} eq 'normal';
-    return process_create_input($tokens, $m)  if $m->{mode} eq 'create';
-    return process_confirm_kill($tokens, $m)  if $m->{mode} eq 'kill';
+    return process_normal($tokens, $m)         if $m->{mode} eq 'normal';
+    return process_create_input($tokens, $m)   if $m->{mode} eq 'create';
+    return process_confirm_kill($tokens, $m)   if $m->{mode} eq 'kill';
+    return process_confirm_force($tokens, $m)  if $m->{mode} eq 'confirm_force';
     return undef;
 }
 
@@ -251,7 +253,21 @@ sub process_normal {
         elsif ($key eq 'Down') { model_select_next($m); }
         elsif ($key eq 'Enter') {
             my $name = model_selected_name($m);
-            return [ 'attach', $name ] if defined $name;
+            if (defined $name) {
+                # Live-check the attached flag at keypress time. The
+                # cached value updates once per keystroke, which goes
+                # stale fast if the user detaches elsewhere and then
+                # sits on the shperl UI without pressing anything.
+                refresh_sessions($m);
+                my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
+                return [ 'attach', $name ] if !$sess;    # let run_tui report "gone"
+                if ($sess->{attached}) {
+                    $m->{mode}      = 'confirm_force';
+                    $m->{mode_data} = $name;
+                    return undef;
+                }
+                return [ 'attach', $name ];
+            }
         }
         elsif ($key eq 'NewSession') {
             $m->{mode}      = 'create';
@@ -315,6 +331,22 @@ sub process_confirm_kill {
             $m->{mode}      = 'normal';
             $m->{mode_data} = '';
             return [ 'kill', $name ];
+        }
+        $m->{mode}      = 'normal';
+        $m->{mode_data} = '';
+        return undef;
+    }
+    return undef;
+}
+
+sub process_confirm_force {
+    my ($tokens, $m) = @_;
+    for my $t (@$tokens) {
+        if ($t->[0] eq 'byte' && ($t->[1] == ord 'y' || $t->[1] == ord 'Y')) {
+            my $name = $m->{mode_data};
+            $m->{mode}      = 'normal';
+            $m->{mode_data} = '';
+            return [ 'attach_force', $name ];
         }
         $m->{mode}      = 'normal';
         $m->{mode_data} = '';
@@ -449,6 +481,16 @@ sub confirm_kill_label {
     label_push_key($l,   qq{"$name"});
     label_push_plain($l, '?   (');
     push_hints($l, \@CONFIRM_KILL_HINTS);
+    label_push_plain($l, ')');
+    return $l;
+}
+
+sub confirm_force_label {
+    my $name = shift;
+    my $l = label_new();
+    label_push_key($l,   qq{"$name"});
+    label_push_plain($l, ' already attached. force-attach?   (');
+    push_hints($l, \@CONFIRM_FORCE_HINTS);
     label_push_plain($l, ')');
     return $l;
 }
@@ -625,6 +667,8 @@ sub render {
         $bottom = normal_bindings_label();
     } elsif ($m->{mode} eq 'create') {
         $bottom = create_input_label($m->{mode_data});
+    } elsif ($m->{mode} eq 'confirm_force') {
+        $bottom = confirm_force_label($m->{mode_data});
     } else {
         $bottom = confirm_kill_label($m->{mode_data});
     }
@@ -654,9 +698,12 @@ sub refresh_sessions {
 # freshly-attached shell starts on a clean viewport. Returns true on
 # successful exit.
 sub shell_attach {
-    my $name = shift;
+    my ($name, $force) = @_;
     tty_clear();
-    my $rc = system 'shpool', 'attach', $name;
+    my @cmd = ('shpool', 'attach');
+    push @cmd, '-f' if $force;
+    push @cmd, $name;
+    my $rc = system @cmd;
     return $rc == 0;
 }
 
@@ -744,7 +791,9 @@ sub run_tui {
             # and is not already attached elsewhere. shpool reports
             # "already has a terminal attached" on stderr with exit 0,
             # and piping stderr breaks shpool's own detach detection,
-            # so we check the attached flag here instead.
+            # so we check the attached flag here instead. If it raced
+            # into Attached since the keystroke, fall into the
+            # force-confirm prompt rather than silently no-opping.
             refresh_sessions($m);
             my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
             if (!$sess) {
@@ -752,11 +801,23 @@ sub run_tui {
                 next;
             }
             if ($sess->{attached}) {
-                model_set_error($m, "'$name' already attached elsewhere");
+                $m->{mode}      = 'confirm_force';
+                $m->{mode_data} = $name;
                 next;
             }
             my $rc = shell_attach($name);
             finish_action($m, $name, $rc, "shpool attach $name failed");
+        }
+        elsif ($cmd eq 'attach_force') {
+            my ($name) = @args;
+            refresh_sessions($m);
+            my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
+            if (!$sess) {
+                model_set_error($m, "session '$name' is gone");
+                next;
+            }
+            my $rc = shell_attach($name, 1);
+            finish_action($m, $name, $rc, "shpool attach -f $name failed");
         }
         elsif ($cmd eq 'create') {
             my ($name) = @args;
@@ -792,6 +853,17 @@ sub run_tui {
 }
 
 sub main {
+    if (my $inside = $ENV{SHPOOL_SESSION_NAME}) {
+        print STDERR <<"EOM";
+shperl: inside shpool session "$inside" — won't run here. Nested sessions
+        get messy (outer attach gets bumped on force, sessions created
+        here inherit this env, ^D leaves you in the wrong layer). Detach
+        first to manage sessions. Current list:
+
+EOM
+        exec { 'shpool' } 'shpool', 'list';
+        die "exec shpool list: $!\n";
+    }
     my $m = model_new();
     refresh_sessions($m);
     run_tui($m);
