@@ -2,7 +2,9 @@
 
 A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel](https://github.com/tdupes/shpiel) but even more better — it's just perl.
 
-`shperl` arranges your shpool sessions in a handsome table. Select, create, kill, and attach to sessions with mere keystrokes. Upon detaching, you will find yourself back at the table.
+Vibe-ported from the vibe-coded [GeoffChurch/shpool-table](https://github.com/GeoffChurch/shpool-table), which is written in Rust to match `shpool`.
+
+`shperl` arranges your shpool sessions in a handsome table. Select, create, kill, and attach to sessions with mere keystrokes. Upon detaching, you will find yourself back at the table. Starting/quitting `shperl` has no effect on your `shpool` sessions, so you can run `shperl` in multiple terminals or tmux panes.
 
 ## What it looks like (colors/highlighting in terminal)
 
@@ -20,7 +22,9 @@ A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel]
 
 ## Install
 
-Trial run:
+First, [install](https://github.com/shell-pool/shpool#installation) `shpool`.
+
+Trial run for commitment-phobes:
 ```bash
 perl -e "$(curl -fsSL https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl)"
 ```
@@ -53,6 +57,6 @@ Detaching from a `shpool` session (`C-S C-q`, or however you've configured it) r
 
 ## How it works
 
-- `shpool list --json` for the model, refreshed after every keypress in normal mode.
+- `shpool list --json` for the table display, refreshed after every keypress in normal mode.
 - `shpool attach <name>` for attach and create. `shperl` is stricter than `shpool` here because it checks if a session name already exists before creating it.
 - `shpool kill <name>` for kill.
