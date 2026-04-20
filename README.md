@@ -20,11 +20,16 @@ A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel]
 
 ## Install
 
-Drop it in your `$PATH` and make it executable:
-
+Trial run:
+```bash
+perl -e "$(curl -fsSL https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl)"
 ```
-curl -o ~/.local/bin/shperl https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl
-chmod +x ~/.local/bin/shperl
+
+Full install:
+```bash
+DEST=~/.local/bin/shperl
+curl -fLo "$DEST" https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl
+chmod +x "$DEST"
 ```
 
 ## Usage
