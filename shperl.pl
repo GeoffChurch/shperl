@@ -7,6 +7,7 @@
 
 use strict;
 use warnings;
+use Getopt::Long qw(GetOptions);
 use JSON::PP ();
 use POSIX ();
 use Time::HiRes qw(time);
@@ -21,11 +22,27 @@ our $SAVED_STTY;
 our $IN_ALT = 0;
 
 END {
-    print STDOUT "\e[?25h\e[?7h\e[?1049l" if $IN_ALT;
+    # ?1004l: disable focus reporting before the alt-screen flip so the
+    # terminal isn't briefly emitting focus bytes into the user's shell
+    # on the way out.
+    print STDOUT "\e[?25h\e[?7h\e[?1004l\e[?1049l" if $IN_ALT;
     if (defined $SAVED_STTY) {
         system 'stty', $SAVED_STTY;
     }
 }
+
+# ---------------------------------------------------------------------------
+# Top-level flags forwarded verbatim to every `shpool` shell-out. Mirrors
+# shpool's own global flags so `shperl --socket /tmp/s2 -vv` behaves
+# like `shpool --socket /tmp/s2 -vv list / attach / kill`. Set once in
+# main(); read by fetch_sessions, shell_attach, the kill shell-out, and
+# the no-nest guard.
+#
+# --daemonize / --no-daemonize are deliberately absent: auto-launching
+# a daemon from under the TUI mid-session is confusing UX. The `D` key
+# binding is the user-driven way to start one.
+# ---------------------------------------------------------------------------
+my @SHPOOL_FLAGS;
 
 # ---------------------------------------------------------------------------
 # SGR codes for the chrome. Phosphor-amber on a dark bar background.
@@ -44,24 +61,34 @@ my $SGR_SELECTED     = "\e[7m";
 # footer hints. Trigger is [kind, byte] with kind 'byte' for plain ASCII
 # or 'csi' for ESC [ <byte> sequences.
 # ---------------------------------------------------------------------------
+# Case synonyms (J/K/N/Q) are listed explicitly rather than folded at
+# lookup time, so case-distinct bindings — d=kill vs. D=daemon — are
+# pure data, not a special case in the dispatcher.
 my @NORMAL_BINDINGS = (
     { label => 'j', desc => 'down', maps => [
         [ ['csi',  ord 'B'], 'Down' ],
         [ ['byte', ord 'j'], 'Down' ],
+        [ ['byte', ord 'J'], 'Down' ],
     ]},
     { label => 'k', desc => 'up', maps => [
         [ ['csi',  ord 'A'], 'Up' ],
         [ ['byte', ord 'k'], 'Up' ],
+        [ ['byte', ord 'K'], 'Up' ],
     ]},
     { label => 'spc', desc => 'attach', maps => [
         [ ['byte', ord ' '], 'Enter' ],
         [ ['byte', 0x0d],    'Enter' ],
         [ ['byte', 0x0a],    'Enter' ],
     ]},
-    { label => 'n', desc => 'new',  maps => [ [ ['byte', ord 'n'], 'NewSession'  ] ]},
+    { label => 'n', desc => 'new',  maps => [
+        [ ['byte', ord 'n'], 'NewSession' ],
+        [ ['byte', ord 'N'], 'NewSession' ],
+    ]},
     { label => 'd', desc => 'kill', maps => [ [ ['byte', ord 'd'], 'KillSession' ] ]},
+    { label => 'D', desc => 'daemon', maps => [ [ ['byte', ord 'D'], 'EnsureDaemon' ] ]},
     { label => 'q', desc => 'quit', maps => [
         [ ['byte', ord 'q'], 'Quit' ],
+        [ ['byte', ord 'Q'], 'Quit' ],
         [ ['byte', 0x03],    'Quit' ],
     ]},
 );
@@ -88,9 +115,7 @@ for my $bind (@NORMAL_BINDINGS) {
 sub token_to_key {
     my $t = shift;
     if ($t->[0] eq 'byte') {
-        my $b = $t->[1];
-        $b += 32 if $b >= ord('A') && $b <= ord('Z');   # fold uppercase
-        return $BYTE_KEY{$b} // 'Other';
+        return $BYTE_KEY{ $t->[1] } // 'Other';
     }
     if ($t->[0] eq 'csi') {
         return $CSI_KEY{ $t->[1] } // 'Other';
@@ -101,8 +126,13 @@ sub token_to_key {
 # ---------------------------------------------------------------------------
 # Session fetch + model
 # ---------------------------------------------------------------------------
+# Optional @extra args go between the global flags and the subcommand —
+# used by the D=daemon binding to slip in `--daemonize` so shpool
+# auto-forks a daemon if one isn't already running. Idempotent when it
+# is.
 sub fetch_sessions {
-    open my $fh, '-|', 'shpool', 'list', '--json'
+    my @extra = @_;
+    open my $fh, '-|', 'shpool', @SHPOOL_FLAGS, @extra, 'list', '--json'
         or die "spawning shpool list --json: $!\n";
     my $json = do { local $/; <$fh> };
     close $fh;
@@ -236,12 +266,30 @@ sub parse_tokens {
 
 sub process_input {
     my ($buf, $m) = @_;
-    $m->{error} = undef;
     my $tokens = parse_tokens($m, $buf);
-    return process_normal($tokens, $m)         if $m->{mode} eq 'normal';
-    return process_create_input($tokens, $m)   if $m->{mode} eq 'create';
-    return process_confirm_kill($tokens, $m)   if $m->{mode} eq 'kill';
-    return process_confirm_force($tokens, $m)  if $m->{mode} eq 'confirm_force';
+
+    # Filter focus events (ESC [ I = gained, ESC [ O = lost) out of the
+    # token stream. Focus-gained refreshes the session list silently —
+    # catches state changes that happened in another window. Focus-lost
+    # is discarded. Done before clearing $m->{error} so a focus event
+    # alone doesn't wipe a pending error message.
+    my @keep;
+    my $focus_gained = 0;
+    for my $t (@$tokens) {
+        if ($t->[0] eq 'csi') {
+            if    ($t->[1] == ord 'I') { $focus_gained = 1; next; }
+            elsif ($t->[1] == ord 'O') { next; }
+        }
+        push @keep, $t;
+    }
+    refresh_sessions($m) if $focus_gained;
+    return undef unless @keep;
+
+    $m->{error} = undef;
+    return process_normal(\@keep, $m)         if $m->{mode} eq 'normal';
+    return process_create_input(\@keep, $m)   if $m->{mode} eq 'create';
+    return process_confirm_kill(\@keep, $m)   if $m->{mode} eq 'kill';
+    return process_confirm_force(\@keep, $m)  if $m->{mode} eq 'confirm_force';
     return undef;
 }
 
@@ -282,6 +330,7 @@ sub process_normal {
             }
             return undef;
         }
+        elsif ($key eq 'EnsureDaemon') { return [ 'ensure_daemon' ]; }
         elsif ($key eq 'Quit') { return [ 'quit' ]; }
         # 'Other' — ignore
     }
@@ -376,13 +425,21 @@ sub tty_enter_alt {
     # 1049h: alt screen. 25l: hide cursor. ?1l: DECCKM off (arrows
     # send ESC[A/B/C/D instead of ESC O A/B/C/D). ?7l: DECAWM off, so
     # any off-by-one width accounting gets clipped at the margin
-    # instead of wrapping.
-    print STDOUT "\e[?1049h\e[?25l\e[?1l\e[?7l";
+    # instead of wrapping. ?1004h: xterm focus reporting on, so the
+    # terminal sends ESC [ I when it regains focus (parsed as a
+    # silent refresh) and ESC [ O when it loses focus (discarded).
+    # Best-effort — terminals without focus-reporting support ignore
+    # the enable sequence.
+    print STDOUT "\e[?1049h\e[?25l\e[?1l\e[?7l\e[?1004h";
     $IN_ALT = 1;
 }
 
 sub tty_leave_alt {
-    print STDOUT "\e[?25h\e[?7h\e[?1049l";
+    # Mirror tty_enter_alt: turn focus reporting off before the
+    # alt-screen exit so the terminal isn't briefly emitting focus
+    # bytes into whatever consumes stdin next (the user's shell, or
+    # the upcoming `shpool attach` child).
+    print STDOUT "\e[?25h\e[?7h\e[?1004l\e[?1049l";
     $IN_ALT = 0;
 }
 
@@ -681,8 +738,8 @@ sub render {
 # Main loop
 # ---------------------------------------------------------------------------
 sub refresh_sessions {
-    my $m = shift;
-    my $new = eval { fetch_sessions() };
+    my ($m, @extra) = @_;
+    my $new = eval { fetch_sessions(@extra) };
     if ($@) {
         my $err = $@;
         chomp $err;
@@ -700,7 +757,7 @@ sub refresh_sessions {
 sub shell_attach {
     my ($name, $force) = @_;
     tty_clear();
-    my @cmd = ('shpool', 'attach');
+    my @cmd = ('shpool', @SHPOOL_FLAGS, 'attach');
     push @cmd, '-f' if $force;
     push @cmd, $name;
     my $rc = system @cmd;
@@ -760,7 +817,15 @@ sub event_loop {
         }
         return [ 'quit' ] if $n == 0;
         my $action = process_input($buf, $m);
-        return $action if $action;
+        if ($action) {
+            # Handled inline so the alt-screen stays up — no point
+            # bouncing out to run_tui for a refresh-shaped action.
+            if ($action->[0] eq 'ensure_daemon') {
+                refresh_sessions($m, '--daemonize');
+                next;
+            }
+            return $action;
+        }
         # In Normal mode, pick up sessions added/removed by other
         # clients since the last keypress. Skipped in modal modes so
         # typing doesn't storm shpool with list calls.
@@ -841,7 +906,7 @@ sub run_tui {
                 model_set_error($m, "session '$name' is gone");
                 next;
             }
-            my ($rc, $err_out) = run_capture_stderr('shpool', 'kill', $name);
+            my ($rc, $err_out) = run_capture_stderr('shpool', @SHPOOL_FLAGS, 'kill', $name);
             $err_out =~ s/^\s+|\s+$//g;
             my $msg = length $err_out ? "kill $name: $err_out" : "kill $name failed";
             finish_action($m, $name, $rc, $msg);
@@ -852,7 +917,31 @@ sub run_tui {
     }
 }
 
+# Parse top-level flags from @ARGV into @SHPOOL_FLAGS. Mirrors the
+# four global flags shpool itself accepts; everything is forwarded
+# verbatim to every shpool shell-out. Unknown flags or stray positional
+# args are a usage error.
+sub parse_args {
+    my ($config_file, $log_file, $socket);
+    my $verbose = 0;
+    GetOptions(
+        'config-file=s' => \$config_file,
+        'log-file=s'    => \$log_file,
+        'socket=s'      => \$socket,
+        'verbose|v+'    => \$verbose,
+    ) or die "Usage: shperl [--config-file PATH] [--log-file PATH] [--socket PATH] [-v ...]\n";
+    @ARGV == 0
+        or die "shperl: unexpected argument(s): @ARGV\n";
+
+    @SHPOOL_FLAGS = ();
+    push @SHPOOL_FLAGS, '--config-file', $config_file if defined $config_file;
+    push @SHPOOL_FLAGS, '--log-file',    $log_file    if defined $log_file;
+    push @SHPOOL_FLAGS, ('-v') x $verbose;
+    push @SHPOOL_FLAGS, '--socket',      $socket      if defined $socket;
+}
+
 sub main {
+    parse_args();
     if (my $inside = $ENV{SHPOOL_SESSION_NAME}) {
         print STDERR <<"EOM";
 shperl: inside shpool session "$inside" — won't run here. Nested sessions
@@ -861,7 +950,7 @@ shperl: inside shpool session "$inside" — won't run here. Nested sessions
         first to manage sessions. Current list:
 
 EOM
-        exec { 'shpool' } 'shpool', 'list';
+        exec { 'shpool' } 'shpool', @SHPOOL_FLAGS, 'list';
         die "exec shpool list: $!\n";
     }
     my $m = model_new();
