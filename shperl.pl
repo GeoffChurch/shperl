@@ -862,6 +862,18 @@ sub shell_attach {
     return $rc == 0;
 }
 
+# Run `shpool kill <name>`, returning (rc, err_message). shpool's
+# stderr (e.g. "no session named 'foo'") is more informative than a
+# generic failure, so we use it when present. Captures stderr rather
+# than letting it land in the alt-screen.
+sub shell_kill {
+    my $name = shift;
+    my ($rc, $err_out) = run_capture_stderr('shpool', @SHPOOL_FLAGS, 'kill', $name);
+    $err_out =~ s/^\s+|\s+$//g;
+    my $msg = length $err_out ? "kill $name: $err_out" : "kill $name failed";
+    return ($rc, $msg);
+}
+
 # Post-action tail shared by attach/create/kill: refresh the session
 # list, reselect the target by name if still present, and park an
 # error message if the action failed.
@@ -994,6 +1006,78 @@ sub event_loop {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Action handlers
+# ---------------------------------------------------------------------------
+# Handlers run in run_tui after event_loop returns an action and the
+# alt-screen is down. Each owns its own pre-flight, shell-out, and
+# error-bar message. `quit` has no handler (run_tui returns directly);
+# `ensure_daemon` is handled inline in event_loop without tearing down
+# the alt-screen — see the comment there.
+
+# Look up a session by name; on miss, set the standard
+# "session 'X' is gone" error and return undef. Hoisted out because
+# three handlers (attach, attach_force, kill) repeat the same lookup-
+# and-bail.
+sub session_or_error {
+    my ($m, $name) = @_;
+    my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
+    return $sess if $sess;
+    model_set_error($m, "session '$name' is gone");
+    return undef;
+}
+
+my %ACTION_HANDLER = (
+    attach => sub {
+        my ($m, $name) = @_;
+        # Pre-flight: refresh and verify the session still exists and
+        # is not already attached elsewhere. shpool reports "already
+        # has a terminal attached" on stderr with exit 0, and piping
+        # stderr breaks shpool's own detach detection, so we check
+        # the attached flag here instead. A race into Attached since
+        # the keystroke promotes to confirm_force rather than
+        # silently no-opping.
+        refresh_sessions($m);
+        my $sess = session_or_error($m, $name) or return;
+        if ($sess->{attached}) {
+            $m->{mode}      = 'confirm_force';
+            $m->{mode_data} = $name;
+            return;
+        }
+        my $rc = shell_attach($m, $name);
+        finish_action($m, $name, $rc, "shpool attach $name failed");
+    },
+    attach_force => sub {
+        my ($m, $name) = @_;
+        refresh_sessions($m);
+        session_or_error($m, $name) or return;
+        my $rc = shell_attach($m, $name, 1);
+        finish_action($m, $name, $rc, "shpool attach -f $name failed");
+    },
+    create => sub {
+        my ($m, $name) = @_;
+        # Pre-flight: reject names that already exist. `shpool attach`
+        # is create-or-attach, so without this check a duplicate name
+        # silently attaches (or flashes "already has a terminal
+        # attached" on stderr and no-ops) — neither is what the
+        # create prompt implies.
+        refresh_sessions($m);
+        if (grep { $_->{name} eq $name } @{$m->{sessions}}) {
+            model_set_error($m, "session '$name' already exists");
+            return;
+        }
+        my $rc = shell_attach($m, $name);
+        finish_action($m, $name, $rc, "shpool attach $name failed");
+    },
+    kill => sub {
+        my ($m, $name) = @_;
+        refresh_sessions($m);
+        session_or_error($m, $name) or return;
+        my ($rc, $err_msg) = shell_kill($name);
+        finish_action($m, $name, $rc, $err_msg);
+    },
+);
+
 sub run_tui {
     my $m = shift;
     # Sets the recompute flag and interrupts select on resize.
@@ -1010,71 +1094,10 @@ sub run_tui {
 
         return unless $action;
         my ($cmd, @args) = @$action;
-
-        if ($cmd eq 'attach') {
-            my ($name) = @args;
-            # Pre-flight: refresh and verify the session still exists
-            # and is not already attached elsewhere. shpool reports
-            # "already has a terminal attached" on stderr with exit 0,
-            # and piping stderr breaks shpool's own detach detection,
-            # so we check the attached flag here instead. If it raced
-            # into Attached since the keystroke, fall into the
-            # force-confirm prompt rather than silently no-opping.
-            refresh_sessions($m);
-            my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
-            if (!$sess) {
-                model_set_error($m, "session '$name' is gone");
-                next;
-            }
-            if ($sess->{attached}) {
-                $m->{mode}      = 'confirm_force';
-                $m->{mode_data} = $name;
-                next;
-            }
-            my $rc = shell_attach($m, $name);
-            finish_action($m, $name, $rc, "shpool attach $name failed");
-        }
-        elsif ($cmd eq 'attach_force') {
-            my ($name) = @args;
-            refresh_sessions($m);
-            my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
-            if (!$sess) {
-                model_set_error($m, "session '$name' is gone");
-                next;
-            }
-            my $rc = shell_attach($m, $name, 1);
-            finish_action($m, $name, $rc, "shpool attach -f $name failed");
-        }
-        elsif ($cmd eq 'create') {
-            my ($name) = @args;
-            # Pre-flight: reject names that already exist. `shpool
-            # attach` is create-or-attach, so without this check a
-            # duplicate name silently attaches (or flashes "already
-            # has a terminal attached" on stderr and no-ops) — neither
-            # is what the create prompt implies.
-            refresh_sessions($m);
-            if (grep { $_->{name} eq $name } @{$m->{sessions}}) {
-                model_set_error($m, "session '$name' already exists");
-                next;
-            }
-            my $rc = shell_attach($m, $name);
-            finish_action($m, $name, $rc, "shpool attach $name failed");
-        }
-        elsif ($cmd eq 'kill') {
-            my ($name) = @args;
-            refresh_sessions($m);
-            if (!grep { $_->{name} eq $name } @{$m->{sessions}}) {
-                model_set_error($m, "session '$name' is gone");
-                next;
-            }
-            my ($rc, $err_out) = run_capture_stderr('shpool', @SHPOOL_FLAGS, 'kill', $name);
-            $err_out =~ s/^\s+|\s+$//g;
-            my $msg = length $err_out ? "kill $name: $err_out" : "kill $name failed";
-            finish_action($m, $name, $rc, $msg);
-        }
-        elsif ($cmd eq 'quit') {
-            return;
-        }
+        return if $cmd eq 'quit';
+        my $handler = $ACTION_HANDLER{$cmd}
+            or die "internal: unknown action '$cmd'\n";
+        $handler->($m, @args);
     }
 }
 
