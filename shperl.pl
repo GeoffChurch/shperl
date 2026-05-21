@@ -44,11 +44,12 @@ END {
 }
 
 # ---------------------------------------------------------------------------
-# Top-level flags forwarded verbatim to every `shpool` shell-out. Mirrors
-# shpool's own global flags so `shperl --socket /tmp/s2 -vv` behaves
-# like `shpool --socket /tmp/s2 -vv list / attach / kill`. Set once in
-# main(); read by fetch_sessions, shell_attach, the kill shell-out, and
-# the no-nest guard.
+# Top-level flags forwarded to every `shpool` shell-out: --config-file,
+# --log-file, --socket, -v. Mirrors shpool's global flag set; if shpool
+# gains a new one, add it here so `shperl --socket /tmp/s2 -vv` keeps
+# behaving like `shpool --socket /tmp/s2 -vv list / attach / kill`. Set
+# once in main(); read by fetch_sessions, shell_attach, the kill
+# shell-out, and the no-nest guard.
 #
 # --daemonize / --no-daemonize are deliberately absent: auto-launching
 # a daemon from under the TUI mid-session is confusing UX. The `D` key
