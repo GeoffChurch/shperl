@@ -26,6 +26,14 @@ our $IN_ALT = 0;
 # (could be hours on an idle daemon), so SIGPIPE isn't a reliable
 # enough leash.
 our $EVENTS_PID;
+# Set by the WINCH handler; cleared each time event_loop fetches the
+# new terminal size. Caching matters because event_loop iterates on
+# every keystroke AND every push event from the daemon (potentially
+# many per second on a busy table), and tty_size() forks `stty size`.
+# event_loop also reads unconditionally on entry — it runs fresh
+# after every action (shell_attach return, etc.) and can't trust
+# stale local state across calls.
+our $WINCH_PENDING;
 
 END {
     # ?1004l: disable focus reporting before the alt-screen flip so the
@@ -896,8 +904,19 @@ sub event_loop {
     my $m = shift;
     my $buf;
     my $stdin_fno = fileno(STDIN);
+    # Initial fetch is unconditional: event_loop runs once per run_tui
+    # iteration (every attach/create/etc tears down and re-enters us),
+    # and the terminal may have resized during that external command
+    # without us noticing. Clear before the read so a WINCH between
+    # the two leaves the flag set for the next iteration — never miss
+    # a resize.
+    $WINCH_PENDING = 0;
+    my ($w, $h) = tty_size();
     while (1) {
-        my ($w, $h) = tty_size();
+        if ($WINCH_PENDING) {
+            $WINCH_PENDING = 0;
+            ($w, $h) = tty_size();
+        }
         my $frame = render($m, $w, $h);
         print STDOUT $frame;
 
@@ -977,8 +996,8 @@ sub event_loop {
 
 sub run_tui {
     my $m = shift;
-    # Empty handler is enough to interrupt sysread on resize.
-    $SIG{WINCH} = sub {};
+    # Sets the recompute flag and interrupts select on resize.
+    $SIG{WINCH} = sub { $WINCH_PENDING = 1 };
 
     while (1) {
         tty_enter_raw();
