@@ -1,7 +1,7 @@
 #!/usr/bin/env perl
-# Single-file Perl port of the shpool-table TUI. Wraps
-# `shpool list --json`, `shpool attach`, and `shpool kill` behind a
-# raw-mode terminal interface.
+# Single-file Perl port of the shpool-table TUI. Wraps `shpool list
+# --json`, `shpool attach`, `shpool kill`, and (when available) `shpool
+# events` behind a raw-mode terminal interface.
 #
 # Core-only dependencies: JSON::PP, POSIX, Time::HiRes.
 
@@ -20,6 +20,12 @@ $| = 1;
 # ---------------------------------------------------------------------------
 our $SAVED_STTY;
 our $IN_ALT = 0;
+# Tracked here (not just on the model) so END can kill the events
+# child on abnormal exit. The child blocks on read from the daemon
+# socket and won't notice shperl is gone until it next tries to write
+# (could be hours on an idle daemon), so SIGPIPE isn't a reliable
+# enough leash.
+our $EVENTS_PID;
 
 END {
     # ?1004l: disable focus reporting before the alt-screen flip so the
@@ -29,6 +35,12 @@ END {
     if (defined $SAVED_STTY) {
         system 'stty', $SAVED_STTY;
     }
+    # Backstop only — main()'s teardown_events normally handles this.
+    # If we reach END with $EVENTS_PID still set, something skipped
+    # the eval/teardown path. No waitpid here: open('-|')'s implicit
+    # close already does one when $m goes out of scope, so just kick
+    # the child and let that close complete.
+    kill 'TERM', $EVENTS_PID if defined $EVENTS_PID;
 }
 
 # ---------------------------------------------------------------------------
@@ -171,6 +183,8 @@ sub model_new {
         mode_data    => '',          # create: partial name; kill/confirm_force: target name
         error        => undef,
         parser_state => 'normal',    # normal | esc | esc_bracket
+        events_pid   => undef,       # `shpool events` child pid, or undef
+        events_fh    => undef,       # read end of its stdout pipe, or undef
     };
 }
 
@@ -282,7 +296,8 @@ sub process_input {
         }
         push @keep, $t;
     }
-    refresh_sessions($m) if $focus_gained;
+    # Skip when events are flowing — the model is already current.
+    refresh_sessions($m) if $focus_gained && !defined $m->{events_fh};
     return undef unless @keep;
 
     $m->{error} = undef;
@@ -306,7 +321,10 @@ sub process_normal {
                 # cached value updates once per keystroke, which goes
                 # stale fast if the user detaches elsewhere and then
                 # sits on the shperl UI without pressing anything.
-                refresh_sessions($m);
+                # With events subscribed, the cache stays current via
+                # the event-driven refresh, so this pre-flight is
+                # redundant.
+                refresh_sessions($m) unless defined $m->{events_fh};
                 my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
                 return [ 'attach', $name ] if !$sess;    # let run_tui report "gone"
                 if ($sess->{attached}) {
@@ -747,6 +765,68 @@ sub refresh_sessions {
         return;
     }
     model_refresh($m, $new);
+    cancel_modal_if_target_gone($m);
+}
+
+# Drop kill/confirm_force modals whose target session has disappeared
+# from under them — any refresh (event-driven, focus-gained, the
+# keystroke fallback) can race ahead of the user. `create` is safe:
+# mode_data is the partial name being typed, not a session reference.
+sub cancel_modal_if_target_gone {
+    my $m = shift;
+    return unless $m->{mode} eq 'kill' || $m->{mode} eq 'confirm_force';
+    my $name = $m->{mode_data};
+    return if grep { $_->{name} eq $name } @{$m->{sessions}};
+    $m->{mode}      = 'normal';
+    $m->{mode_data} = '';
+    model_set_error($m, "session '$name' is gone");
+}
+
+# Spawn `shpool events` as a child whose stdout we read line-by-line.
+# Uses the two-arg `open '-|'` fork so we can silence the child's
+# stderr before exec. The child can fail for several reasons — binary
+# doesn't have the subcommand (older shpool), daemon isn't running,
+# daemon predates the events socket, etc. — and they all converge on
+# EOF on the pipe, which event_loop handles uniformly. We don't probe
+# capability up front: the subscribe attempt itself is the cheapest,
+# most accurate signal, and the EOF path is the same fallback either
+# way. Returns (pid, fh) or (undef, undef) on fork failure.
+sub spawn_events {
+    my $pid = open my $fh, '-|';
+    return (undef, undef) unless defined $pid;
+    if ($pid == 0) {
+        open STDERR, '>', '/dev/null';
+        no warnings 'exec';
+        exec { 'shpool' } 'shpool', @SHPOOL_FLAGS, 'events';
+        POSIX::_exit(127);
+    }
+    return ($pid, $fh);
+}
+
+# Idempotent: spawns an events subscriber if we don't already have
+# one. Used at startup, after shell_attach returns, and after the
+# EnsureDaemon path so the subscription comes back without the user
+# having to do anything. Not called from the EOF branch of event_loop
+# — see the comment there.
+sub ensure_events {
+    my $m = shift;
+    return if defined $m->{events_pid};
+    ($m->{events_pid}, $m->{events_fh}) = spawn_events();
+    $EVENTS_PID = $m->{events_pid};
+}
+
+# Stop the events subscriber and reap it. SIGTERM the child even if
+# it has already exited on its own (e.g. the daemon dropped us);
+# waitpid then just reaps the zombie.
+sub teardown_events {
+    my $m = shift;
+    return unless defined $m->{events_pid};
+    kill 'TERM', $m->{events_pid};
+    waitpid $m->{events_pid}, 0;
+    close $m->{events_fh} if defined $m->{events_fh};
+    $m->{events_pid} = undef;
+    $m->{events_fh}  = undef;
+    $EVENTS_PID      = undef;
 }
 
 # Spawn `shpool attach <name>`, handing the TTY over to the child.
@@ -754,13 +834,22 @@ sub refresh_sessions {
 # created on the fly). Clears the rendered frame first so the user's
 # freshly-attached shell starts on a clean viewport. Returns true on
 # successful exit.
+#
+# Tears the events subscriber down for the duration of the attached
+# session: shperl is blocked in system(), so it can't drain the events
+# pipe, and the daemon would eventually drop the connection anyway
+# (bounded per-subscriber queue). Not strictly required — the
+# subscriber would die on its own and ensure_events would respawn it —
+# but this saves a process and makes the reconnect deterministic.
 sub shell_attach {
-    my ($name, $force) = @_;
+    my ($m, $name, $force) = @_;
     tty_clear();
     my @cmd = ('shpool', @SHPOOL_FLAGS, 'attach');
     push @cmd, '-f' if $force;
     push @cmd, $name;
+    teardown_events($m);
     my $rc = system @cmd;
+    ensure_events($m);
     return $rc == 0;
 }
 
@@ -805,31 +894,83 @@ sub run_capture_stderr {
 sub event_loop {
     my $m = shift;
     my $buf;
+    my $stdin_fno = fileno(STDIN);
     while (1) {
         my ($w, $h) = tty_size();
         my $frame = render($m, $w, $h);
         print STDOUT $frame;
 
-        my $n = sysread(STDIN, $buf, 16);
-        if (!defined $n) {
+        # 4-arg select over STDIN plus (if subscribed) the events fh.
+        # Using built-in select + vec keeps this core-deps-only; an
+        # IO::Select wrapper would add nothing.
+        my $rin = '';
+        vec($rin, $stdin_fno, 1) = 1;
+        my $ev_fno;
+        if (defined $m->{events_fh}) {
+            $ev_fno = fileno($m->{events_fh});
+            vec($rin, $ev_fno, 1) = 1;
+        }
+        # select(2) writes the result mask into the input arg, so copy.
+        my $rout = $rin;
+        my $nfound = select($rout, undef, undef, undef);
+        if ($nfound < 0) {
             next if $!{EINTR};      # SIGWINCH — re-render
-            die "read stdin: $!";
+            die "select: $!";
         }
-        return [ 'quit' ] if $n == 0;
-        my $action = process_input($buf, $m);
-        if ($action) {
-            # Handled inline so the alt-screen stays up — no point
-            # bouncing out to run_tui for a refresh-shaped action.
-            if ($action->[0] eq 'ensure_daemon') {
-                refresh_sessions($m, '--daemonize');
-                next;
+
+        # Drain events first so the refreshed state is in place before
+        # we react to the keystroke (matters for Enter: the attached
+        # flag drives the force-confirm path). The wire payload is
+        # content-free — every event just means "call list again" —
+        # so we discard the bytes and let refresh_sessions do the work.
+        if (defined $ev_fno && vec($rout, $ev_fno, 1)) {
+            my $junk;
+            my $got = sysread($m->{events_fh}, $junk, 4096);
+            if (!defined $got) {
+                die "read events: $!" unless $!{EINTR};
+            } elsif ($got == 0) {
+                # EOF — daemon went away, slow-subscriber drop, etc.
+                # Reap; don't auto-respawn (ensure_events from
+                # shell_attach/EnsureDaemon retries on its own —
+                # auto-retry here risks a tight loop if the daemon
+                # is genuinely down).
+                teardown_events($m);
+                refresh_sessions($m);
+                # Don't clobber a more informative error from
+                # refresh_sessions itself (e.g. "shpool list: ...").
+                model_set_error($m, 'events subscription dropped — press D to retry')
+                    unless defined $m->{error};
+            } else {
+                refresh_sessions($m);
             }
-            return $action;
         }
-        # In Normal mode, pick up sessions added/removed by other
-        # clients since the last keypress. Skipped in modal modes so
-        # typing doesn't storm shpool with list calls.
-        refresh_sessions($m) if $m->{mode} eq 'normal';
+
+        if (vec($rout, $stdin_fno, 1)) {
+            my $n = sysread(STDIN, $buf, 16);
+            if (!defined $n) {
+                next if $!{EINTR};
+                die "read stdin: $!";
+            }
+            return [ 'quit' ] if $n == 0;
+            my $action = process_input($buf, $m);
+            if ($action) {
+                # Handled inline so the alt-screen stays up — no point
+                # bouncing out to run_tui for a refresh-shaped action.
+                if ($action->[0] eq 'ensure_daemon') {
+                    refresh_sessions($m, '--daemonize');
+                    ensure_events($m);
+                    next;
+                }
+                return $action;
+            }
+            # Fallback path when we're not subscribed: pick up state
+            # changes from other clients on each keystroke. Skipped in
+            # modal modes so typing doesn't storm shpool with list
+            # calls. Unneeded when events are flowing (they already
+            # poked us above), so it's gated on the subscription state.
+            refresh_sessions($m)
+                if !defined $m->{events_fh} && $m->{mode} eq 'normal';
+        }
     }
 }
 
@@ -870,7 +1011,7 @@ sub run_tui {
                 $m->{mode_data} = $name;
                 next;
             }
-            my $rc = shell_attach($name);
+            my $rc = shell_attach($m, $name);
             finish_action($m, $name, $rc, "shpool attach $name failed");
         }
         elsif ($cmd eq 'attach_force') {
@@ -881,7 +1022,7 @@ sub run_tui {
                 model_set_error($m, "session '$name' is gone");
                 next;
             }
-            my $rc = shell_attach($name, 1);
+            my $rc = shell_attach($m, $name, 1);
             finish_action($m, $name, $rc, "shpool attach -f $name failed");
         }
         elsif ($cmd eq 'create') {
@@ -896,7 +1037,7 @@ sub run_tui {
                 model_set_error($m, "session '$name' already exists");
                 next;
             }
-            my $rc = shell_attach($name);
+            my $rc = shell_attach($m, $name);
             finish_action($m, $name, $rc, "shpool attach $name failed");
         }
         elsif ($cmd eq 'kill') {
@@ -954,8 +1095,27 @@ EOM
         die "exec shpool list: $!\n";
     }
     my $m = model_new();
-    refresh_sessions($m);
-    run_tui($m);
+    # Subscribe before the initial list so events firing during the
+    # list call still wake us. Doesn't close the window fully — an
+    # event between the fork and the child's connect is still lost,
+    # but EVENTS.md (§Slow subscribers) is clear that there's no
+    # replay, so this is the best we can do without per-action polls.
+    #
+    # The teardown_events call below is load-bearing for clean exit,
+    # not just hygiene: open('-|') makes Perl track the child PID, and
+    # the implicit close when $m goes out of scope does a blocking
+    # waitpid on it. Without an explicit kill first, shperl hangs
+    # holding the terminal after `q` until the events child happens to
+    # die on its own — which is why the END-block kill alone isn't
+    # enough (END fires after scope cleanup, too late).
+    eval {
+        ensure_events($m);
+        refresh_sessions($m);
+        run_tui($m);
+    };
+    my $err = $@;
+    teardown_events($m);
+    die $err if $err;
 }
 
 main() unless caller;
