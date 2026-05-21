@@ -338,6 +338,53 @@ sub process_input {
     return undef;
 }
 
+# Normal-mode key handlers. Each takes the model and returns either
+# an action arrayref (propagated out, alt-screen tears down) or undef
+# (mutate state and continue). Handlers that change mode (NewSession,
+# KillSession, Enter's force-promote) return undef but leave
+# $m->{mode} != 'normal'; the dispatcher stops iterating in that case
+# so the rest of the burst doesn't get run through normal-mode logic.
+my %NORMAL_HANDLERS = (
+    Up   => sub { model_select_prev($_[0]); undef },
+    Down => sub { model_select_next($_[0]); undef },
+    Enter => sub {
+        my $m = shift;
+        my $name = model_selected_name($m);
+        return undef unless defined $name;
+        # Live-check the attached flag at keypress time. The cached
+        # value updates once per keystroke, which goes stale fast if
+        # the user detaches elsewhere and then sits on the shperl UI
+        # without pressing anything. With events subscribed, the
+        # cache stays current via the event-driven refresh, so this
+        # pre-flight is redundant.
+        refresh_sessions($m) unless defined $m->{events_fh};
+        my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
+        return [ 'attach', $name ] if !$sess;    # let run_tui report "gone"
+        if ($sess->{attached}) {
+            $m->{mode}      = 'confirm_force';
+            $m->{mode_data} = $name;
+            return undef;
+        }
+        return [ 'attach', $name ];
+    },
+    NewSession => sub {
+        my $m = shift;
+        $m->{mode}      = 'create';
+        $m->{mode_data} = '';
+        return undef;
+    },
+    KillSession => sub {
+        my $m = shift;
+        my $name = model_selected_name($m);
+        return undef unless defined $name;
+        $m->{mode}      = 'kill';
+        $m->{mode_data} = $name;
+        return undef;
+    },
+    EnsureDaemon => sub { [ 'ensure_daemon' ] },
+    Quit         => sub { [ 'quit' ] },
+);
+
 sub process_normal {
     my ($tokens, $m) = @_;
     for my $t (@$tokens) {
@@ -354,45 +401,12 @@ sub process_normal {
             $m->{error}        = undef;
             next if $key eq 'Enter' || $key eq 'KillSession';
         }
-        if    ($key eq 'Up')   { model_select_prev($m); }
-        elsif ($key eq 'Down') { model_select_next($m); }
-        elsif ($key eq 'Enter') {
-            my $name = model_selected_name($m);
-            if (defined $name) {
-                # Live-check the attached flag at keypress time. The
-                # cached value updates once per keystroke, which goes
-                # stale fast if the user detaches elsewhere and then
-                # sits on the shperl UI without pressing anything.
-                # With events subscribed, the cache stays current via
-                # the event-driven refresh, so this pre-flight is
-                # redundant.
-                refresh_sessions($m) unless defined $m->{events_fh};
-                my ($sess) = grep { $_->{name} eq $name } @{$m->{sessions}};
-                return [ 'attach', $name ] if !$sess;    # let run_tui report "gone"
-                if ($sess->{attached}) {
-                    $m->{mode}      = 'confirm_force';
-                    $m->{mode_data} = $name;
-                    return undef;
-                }
-                return [ 'attach', $name ];
-            }
-        }
-        elsif ($key eq 'NewSession') {
-            $m->{mode}      = 'create';
-            $m->{mode_data} = '';
-            return undef;
-        }
-        elsif ($key eq 'KillSession') {
-            my $name = model_selected_name($m);
-            if (defined $name) {
-                $m->{mode}      = 'kill';
-                $m->{mode_data} = $name;
-            }
-            return undef;
-        }
-        elsif ($key eq 'EnsureDaemon') { return [ 'ensure_daemon' ]; }
-        elsif ($key eq 'Quit') { return [ 'quit' ]; }
-        # 'Other' — ignore
+        my $handler = $NORMAL_HANDLERS{$key} or next;  # 'Other' — ignore
+        my $action = $handler->($m);
+        return $action if $action;
+        # Stop iterating once a handler has switched out of normal
+        # mode — subsequent tokens belong to the new mode's handler.
+        return undef if $m->{mode} ne 'normal';
     }
     return undef;
 }
