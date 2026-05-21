@@ -114,10 +114,6 @@ my @NORMAL_BINDINGS = (
     ]},
 );
 
-my @CREATE_HINTS        = ( [ 'ret', 'create'  ], [ 'esc', 'cancel' ] );
-my @CONFIRM_KILL_HINTS  = ( [ 'y',   'confirm' ], [ 'n',   'cancel' ] );
-my @CONFIRM_FORCE_HINTS = ( [ 'y',   'force'   ], [ 'n',   'cancel' ] );
-
 # Precomputed dispatch tables built once from @NORMAL_BINDINGS.
 my (%BYTE_KEY, %CSI_KEY);
 for my $bind (@NORMAL_BINDINGS) {
@@ -173,7 +169,9 @@ sub fetch_sessions {
     return $sessions;
 }
 
-sub last_active_ms {
+# Latest timestamp on the session — includes started_at so a
+# brand-new session sorts as recent even before any connect/detach.
+sub last_touched_ms {
     my $s = shift;
     my $a = $s->{last_connected_at_unix_ms}    // 0;
     my $b = $s->{last_disconnected_at_unix_ms} // 0;
@@ -237,7 +235,7 @@ sub model_select_prev {
 # consumed as ack without acting on the new occupant of the slot).
 sub model_refresh {
     my ($m, $new) = @_;
-    my @sorted = sort { last_active_ms($b) <=> last_active_ms($a) } @$new;
+    my @sorted = sort { last_touched_ms($b) <=> last_touched_ms($a) } @$new;
     my $prev_name = model_selected_name($m);
     my $prev_idx  = $m->{selected};
     $m->{sessions} = \@sorted;
@@ -253,8 +251,11 @@ sub model_refresh {
         $m->{stale_select} = 1;
         model_set_error($m, "session '$prev_name' is gone");
     }
-    my $last = @sorted ? $#sorted : 0;
-    $m->{selected} = $prev_idx > $last ? $last : $prev_idx;
+    # Skip the clamp on an empty list — there's no valid index, and
+    # model_select_next/prev (the other write-paths) likewise leave
+    # $selected untouched in that case.
+    return unless @sorted;
+    $m->{selected} = $prev_idx > $#sorted ? $#sorted : $prev_idx;
 }
 
 sub model_set_error {
@@ -502,11 +503,6 @@ sub tty_leave_alt {
     $IN_ALT = 0;
 }
 
-# Clear visible area + home cursor. Preserves scrollback (no \e[3J).
-sub tty_clear {
-    print STDOUT "\e[2J\e[H";
-}
-
 sub tty_size {
     my $out = `stty size 2>/dev/null`;
     if ($out =~ /^(\d+)\s+(\d+)/) {
@@ -577,7 +573,7 @@ sub create_input_label {
     label_push_plain($l, 'new session: ');
     label_push_key($l,   $input);
     label_push_plain($l, '_   (');
-    push_hints($l, \@CREATE_HINTS);
+    push_hints($l, [ [ 'ret', 'create' ], [ 'esc', 'cancel' ] ]);
     label_push_plain($l, ')');
     return $l;
 }
@@ -596,7 +592,7 @@ sub confirm_kill_label {
     label_push_plain($l, 'kill ');
     label_push_key($l,   qq{"$name"});
     label_push_plain($l, '?   (');
-    push_hints($l, \@CONFIRM_KILL_HINTS);
+    push_hints($l, [ [ 'y', 'confirm' ], [ 'n', 'cancel' ] ]);
     label_push_plain($l, ')');
     return $l;
 }
@@ -606,7 +602,7 @@ sub confirm_force_label {
     my $l = label_new();
     label_push_key($l,   qq{"$name"});
     label_push_plain($l, ' already attached. force-attach?   (');
-    push_hints($l, \@CONFIRM_FORCE_HINTS);
+    push_hints($l, [ [ 'y', 'force' ], [ 'n', 'cancel' ] ]);
     label_push_plain($l, ')');
     return $l;
 }
@@ -758,7 +754,7 @@ sub render {
             my $dot   = $s->{attached} ? '*' : ' ';
             my $arrow = $is_selected   ? '>' : ' ';
             my $created = format_age($now, $s->{started_at_unix_ms} // 0);
-            my $active  = format_age($now, last_active_ms($s));
+            my $active  = format_age($now, last_touched_ms($s));
             my $text = clip_plain(
                 sprintf("%s%s%-*s%s%-*s%s%-*s",
                     $dot, $arrow,
@@ -885,7 +881,10 @@ sub teardown_events {
 # but this saves a process and makes the reconnect deterministic.
 sub shell_attach {
     my ($m, $name, $force) = @_;
-    tty_clear();
+    # 2J + H: clear visible area and home the cursor so the user's
+    # freshly-attached shell starts on a clean viewport. No \e[3J —
+    # preserve scrollback.
+    print STDOUT "\e[2J\e[H";
     my @cmd = ('shpool', @SHPOOL_FLAGS, 'attach');
     push @cmd, '-f' if $force;
     push @cmd, $name;
