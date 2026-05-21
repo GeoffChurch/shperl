@@ -301,10 +301,10 @@ sub process_input {
     return undef unless @keep;
 
     $m->{error} = undef;
-    return process_normal(\@keep, $m)         if $m->{mode} eq 'normal';
-    return process_create_input(\@keep, $m)   if $m->{mode} eq 'create';
-    return process_confirm_kill(\@keep, $m)   if $m->{mode} eq 'kill';
-    return process_confirm_force(\@keep, $m)  if $m->{mode} eq 'confirm_force';
+    return process_normal(\@keep, $m)                          if $m->{mode} eq 'normal';
+    return process_create_input(\@keep, $m)                    if $m->{mode} eq 'create';
+    return process_yn_confirm(\@keep, $m, 'kill')              if $m->{mode} eq 'kill';
+    return process_yn_confirm(\@keep, $m, 'attach_force')      if $m->{mode} eq 'confirm_force';
     return undef;
 }
 
@@ -390,34 +390,34 @@ sub process_create_input {
     return undef;
 }
 
-sub process_confirm_kill {
-    my ($tokens, $m) = @_;
+# Yes/no confirm modals (kill, confirm_force) share their key
+# handling: y/Y commits with $verb as the action; n/N/Esc/^C cancel;
+# csi (arrows) and other unmapped keys are ignored so a fat-finger
+# doesn't silently dismiss the prompt. Matches process_create_input's
+# "specific keys only" style — only the keys advertised in the
+# bottom-bar copy have effects.
+sub process_yn_confirm {
+    my ($tokens, $m, $verb) = @_;
     for my $t (@$tokens) {
-        if ($t->[0] eq 'byte' && ($t->[1] == ord 'y' || $t->[1] == ord 'Y')) {
+        next if $t->[0] eq 'csi';
+        if ($t->[0] eq 'bare_esc') {
+            $m->{mode}      = 'normal';
+            $m->{mode_data} = '';
+            return undef;
+        }
+        my $b = $t->[1];
+        if ($b == ord 'y' || $b == ord 'Y') {
             my $name = $m->{mode_data};
             $m->{mode}      = 'normal';
             $m->{mode_data} = '';
-            return [ 'kill', $name ];
+            return [ $verb, $name ];
         }
-        $m->{mode}      = 'normal';
-        $m->{mode_data} = '';
-        return undef;
-    }
-    return undef;
-}
-
-sub process_confirm_force {
-    my ($tokens, $m) = @_;
-    for my $t (@$tokens) {
-        if ($t->[0] eq 'byte' && ($t->[1] == ord 'y' || $t->[1] == ord 'Y')) {
-            my $name = $m->{mode_data};
+        if ($b == 0x03 || $b == ord 'n' || $b == ord 'N') {
             $m->{mode}      = 'normal';
             $m->{mode_data} = '';
-            return [ 'attach_force', $name ];
+            return undef;
         }
-        $m->{mode}      = 'normal';
-        $m->{mode_data} = '';
-        return undef;
+        # other keys ignored — stay in modal
     }
     return undef;
 }
