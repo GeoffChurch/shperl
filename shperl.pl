@@ -188,6 +188,13 @@ sub model_new {
     return {
         sessions     => [],
         selected     => 0,
+        # stale_select is the source of truth for "no valid selection"
+        # (rather than $selected having a sentinel value): set when a
+        # refresh removes the previously-selected session, cleared by
+        # navigation or by ack. Decoupling from $selected means a
+        # concurrent session creation can't quietly revalidate a stale
+        # index.
+        stale_select => 0,
         mode         => 'normal',    # normal | create | kill | confirm_force
         mode_data    => '',          # create: partial name; kill/confirm_force: target name
         error        => undef,
@@ -199,6 +206,7 @@ sub model_new {
 
 sub model_selected_name {
     my $m = shift;
+    return undef if $m->{stale_select};
     return undef unless @{$m->{sessions}};
     return undef if $m->{selected} >= @{$m->{sessions}};
     return $m->{sessions}[$m->{selected}]{name};
@@ -207,12 +215,14 @@ sub model_selected_name {
 sub model_select_next {
     my $m = shift;
     return unless @{$m->{sessions}};
+    $m->{stale_select} = 0;
     $m->{selected} = ($m->{selected} + 1) % scalar @{$m->{sessions}};
 }
 
 sub model_select_prev {
     my $m = shift;
     return unless @{$m->{sessions}};
+    $m->{stale_select} = 0;
     if ($m->{selected} == 0) {
         $m->{selected} = $#{$m->{sessions}};
     } else {
@@ -221,7 +231,10 @@ sub model_select_prev {
 }
 
 # Replace session list, sorting newest-active first and preserving the
-# previous selection by name where possible, otherwise clamping.
+# previous selection by name where possible. On miss, flag the model
+# as stale and park an error — the user has to ack (any keystroke
+# clears the error; navigation clears stale_select; Enter/d are
+# consumed as ack without acting on the new occupant of the slot).
 sub model_refresh {
     my ($m, $new) = @_;
     my @sorted = sort { last_active_ms($b) <=> last_active_ms($a) } @$new;
@@ -231,10 +244,14 @@ sub model_refresh {
     if (defined $prev_name) {
         for my $i (0 .. $#sorted) {
             if ($sorted[$i]{name} eq $prev_name) {
-                $m->{selected} = $i;
+                $m->{selected}     = $i;
+                $m->{stale_select} = 0;
                 return;
             }
         }
+        # Previously-selected session is gone.
+        $m->{stale_select} = 1;
+        model_set_error($m, "session '$prev_name' is gone");
     }
     my $last = @sorted ? $#sorted : 0;
     $m->{selected} = $prev_idx > $last ? $last : $prev_idx;
@@ -309,7 +326,10 @@ sub process_input {
     refresh_sessions($m) if $focus_gained && !defined $m->{events_fh};
     return undef unless @keep;
 
-    $m->{error} = undef;
+    # Keep the error visible across the first keystroke when we're in
+    # a stale-selection state — process_normal then consumes it as
+    # acknowledgment (see comment there) and clears both flag + error.
+    $m->{error} = undef unless $m->{stale_select};
     return process_normal(\@keep, $m)                          if $m->{mode} eq 'normal';
     return process_create_input(\@keep, $m)                    if $m->{mode} eq 'create';
     return process_yn_confirm(\@keep, $m, 'kill')              if $m->{mode} eq 'kill';
@@ -321,6 +341,18 @@ sub process_normal {
     my ($tokens, $m) = @_;
     for my $t (@$tokens) {
         my $key = token_to_key($t);
+        if ($m->{stale_select}) {
+            # Selection went stale (a refresh removed the highlighted
+            # session). Consume this token as acknowledgment — clear
+            # the flag and the error so they don't stick further. For
+            # Enter/d (act-on-selection), the user is presumed to be
+            # attempting the original action; we don't want it landing
+            # on whatever happens to be at the same row now, so skip
+            # to the next token without dispatching.
+            $m->{stale_select} = 0;
+            $m->{error}        = undef;
+            next if $key eq 'Enter' || $key eq 'KillSession';
+        }
         if    ($key eq 'Up')   { model_select_prev($m); }
         elsif ($key eq 'Down') { model_select_next($m); }
         elsif ($key eq 'Enter') {
@@ -722,8 +754,9 @@ sub render {
             # sees the state without having to hit Enter and get the
             # pre-flight rejection. ASCII so we don't depend on the
             # terminal's locale/font.
-            my $dot   = $s->{attached}         ? '*' : ' ';
-            my $arrow = ($i == $m->{selected}) ? '>' : ' ';
+            my $is_selected = !$m->{stale_select} && $i == $m->{selected};
+            my $dot   = $s->{attached} ? '*' : ' ';
+            my $arrow = $is_selected   ? '>' : ' ';
             my $created = format_age($now, $s->{started_at_unix_ms} // 0);
             my $active  = format_age($now, last_active_ms($s));
             my $text = clip_plain(
@@ -736,7 +769,7 @@ sub render {
                     $active_width,  $active),
                 $w,
             );
-            if ($i == $m->{selected}) {
+            if ($is_selected) {
                 $out .= sprintf("%s%-*s%s\r\n", $SGR_SELECTED, $w, $text, $SGR_RESET);
             } else {
                 $out .= sprintf("%-*s\r\n", $w, $text);
