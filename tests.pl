@@ -234,4 +234,76 @@ subtest 'normal mode still shows errors' => sub {
     like($out, qr/foo' is gone/, 'error visible in normal mode');
 };
 
+# ---------------------------------------------------------------------------
+# model_advance_off + post-kill refresh: a deliberate kill shouldn't
+# raise stale_select on the session the user just asked us to remove
+# ---------------------------------------------------------------------------
+
+sub session_record {
+    my ($name, $ts) = @_;
+    return {
+        name => $name, status => 'Disconnected',
+        started_at_unix_ms           => $ts,
+        last_connected_at_unix_ms    => $ts,
+        last_disconnected_at_unix_ms => $ts,
+    };
+}
+
+subtest 'model_advance_off mid-list: cursor lands on next neighbor' => sub {
+    my $m = main::model_new();
+    main::model_refresh($m, [
+        session_record('a', 300),
+        session_record('b', 200),
+        session_record('c', 100),
+    ]);
+    $m->{selected} = 1;   # 'b' (between a and c by sort)
+    main::model_advance_off($m, 'b');
+    is(main::model_selected_name($m), 'c', 'cursor advanced to next');
+    # Now simulate the kill: refresh with b gone.
+    main::model_refresh($m, [
+        session_record('a', 300),
+        session_record('c', 100),
+    ]);
+    is($m->{stale_select}, 0,   'no stale_select after deliberate kill');
+    is($m->{error},        undef, 'no error after deliberate kill');
+    is(main::model_selected_name($m), 'c', 'cursor still on c');
+};
+
+subtest 'model_advance_off at end: cursor lands on previous' => sub {
+    my $m = main::model_new();
+    main::model_refresh($m, [
+        session_record('a', 300),
+        session_record('b', 200),
+    ]);
+    $m->{selected} = 1;   # 'b' is last
+    main::model_advance_off($m, 'b');
+    is(main::model_selected_name($m), 'a', 'cursor advanced to previous');
+    main::model_refresh($m, [ session_record('a', 300) ]);
+    is($m->{stale_select}, 0, 'no stale_select');
+    is(main::model_selected_name($m), 'a', 'cursor still on a');
+};
+
+subtest 'model_advance_off when target is the only session: cursor clears' => sub {
+    my $m = main::model_new();
+    main::model_refresh($m, [ session_record('a', 300) ]);
+    $m->{selected} = 0;
+    main::model_advance_off($m, 'a');
+    is(main::model_selected_name($m), undef, 'no selection');
+    is($m->{stale_select}, 0, 'cleared via out-of-bounds, not stale_select');
+    main::model_refresh($m, []);
+    is($m->{stale_select}, 0, 'still no stale_select after empty refresh');
+    is($m->{error},        undef, 'no error from a deliberate-empty');
+};
+
+subtest 'model_advance_off is a no-op when target is not selected' => sub {
+    my $m = main::model_new();
+    main::model_refresh($m, [
+        session_record('a', 300),
+        session_record('b', 200),
+    ]);
+    $m->{selected} = 0;   # on 'a'
+    main::model_advance_off($m, 'b');   # killing the unselected one
+    is(main::model_selected_name($m), 'a', 'cursor unchanged');
+};
+
 done_testing();

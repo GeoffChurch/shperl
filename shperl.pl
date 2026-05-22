@@ -228,6 +228,36 @@ sub model_select_prev {
     }
 }
 
+# Drop the selection without raising stale_select. Setting $selected
+# out of bounds is the model invariant for "no selection" when the
+# caller knows the absence is expected (e.g. a user-initiated kill
+# of the last session); stale_select is reserved for unexpected
+# disappearances where the user should be alerted.
+sub model_clear_selection {
+    my $m = shift;
+    $m->{selected} = scalar @{$m->{sessions}};
+}
+
+# Move selection off $name to the neighbor (next, or previous if it
+# was last). If $name is the only session, clear instead. No-op if
+# $name isn't currently selected. Used before a deliberate kill so
+# the post-kill refresh's model_refresh finds prev_name (the
+# neighbor, or undef) in the new list and doesn't flag stale_select
+# on what was a user-initiated removal.
+sub model_advance_off {
+    my ($m, $name) = @_;
+    my $current = model_selected_name($m);
+    return unless defined $current && $current eq $name;
+    my @sess = @{$m->{sessions}};
+    my ($idx) = grep { $sess[$_]{name} eq $name } 0 .. $#sess;
+    return unless defined $idx;
+    if (@sess == 1) {
+        model_clear_selection($m);
+        return;
+    }
+    $m->{selected} = $idx == $#sess ? $idx - 1 : $idx + 1;
+}
+
 # Replace session list, sorting newest-active first and preserving the
 # previous selection by name where possible. On miss, flag the model
 # as stale and park an error — the user has to ack (any keystroke
@@ -1120,6 +1150,10 @@ my %ACTION_HANDLER = (
         my ($m, $name) = @_;
         refresh_sessions($m);
         session_or_error($m, $name) or return;
+        # Move the cursor off the target before the kill so the
+        # post-kill refresh doesn't raise stale_select on a session
+        # we deliberately removed.
+        model_advance_off($m, $name);
         my ($rc, $err_msg) = shell_kill($name);
         finish_action($m, $name, $rc, $err_msg);
     },
