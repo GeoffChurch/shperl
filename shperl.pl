@@ -1207,6 +1207,9 @@ EOM
     die $err if $err;
 }
 
+# Run as a script unless loaded via `require`. The modulino pattern
+# is here so tests.pl can poke at internal subs (process_normal,
+# model_refresh, etc.) cheaply, without subprocess + pty mocking.
 main() unless caller;
 
 1;
