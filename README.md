@@ -2,9 +2,9 @@
 
 A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel](https://github.com/tdupes/shpiel) but even more enlightened — it's just perl.
 
-[shpool-table](https://github.com/GeoffChurch/shpool-table) is shperl's counterpart in Rust.
+[`shpool-table`](https://github.com/GeoffChurch/shpool-table) is shperl's counterpart in Rust.
 
-`shperl` arranges your shpool sessions in a handsome table. Select, create, kill, and attach to sessions with mere keystrokes. Upon detaching, you will find yourself back at the table. Starting/quitting `shperl` has no effect on your `shpool` sessions, so you can run `shperl` in multiple terminals or tmux panes.
+`shperl` arranges your `shpool` sessions in a comely table. Select, create, kill, and attach to sessions with mere keystrokes. Upon detaching, you will find yourself back at the table. Starting/quitting `shperl` has no effect on your `shpool` sessions, so you can run `shperl` in multiple terminals or tmux panes.
 
 ## What it looks like (colors/highlighting in terminal)
 
@@ -22,19 +22,22 @@ A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel]
 
 ## Install
 
-First, [install](https://github.com/shell-pool/shpool#installation) `shpool`.
+1. [Install `shpool`](https://github.com/shell-pool/shpool#installation)
+2. Set your table with whatever flavor you like:
+   
+   - *L'amuse-bouche*
 
-Trial run for commitment-phobes:
-```bash
-perl -e "$(curl -fsSL https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl)"
-```
+     ```bash
+     perl -e "$(curl -fsSL https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl)"
+     ```
 
-Full install:
-```bash
-DEST=~/.local/bin/shperl
-curl -fLo "$DEST" https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl
-chmod +x "$DEST"
-```
+   - *Le plat de résistance*
+
+     ```bash
+     DEST=~/.local/bin/shperl
+     curl -fLo "$DEST" https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl
+     chmod +x "$DEST"
+     ```
 
 ## Usage
 
@@ -42,7 +45,7 @@ chmod +x "$DEST"
 shperl [--config-file PATH] [--log-file PATH] [--socket PATH] [-v ...]
 ```
 
-Any flags are forwarded verbatim to every `shpool` invocation, so e.g. `shperl --socket /tmp/s2` manages sessions on a non-default daemon.
+These flags are forwarded verbatim to every `shpool` invocation, so e.g. `shperl --socket /tmp/s2` manages sessions on a non-default daemon.
 
 Keys:
 
@@ -62,6 +65,7 @@ The session list also auto-refreshes when the terminal regains focus, so switchi
 
 ## How it works
 
-- `shpool list --json` for the table display, refreshed after every keypress in normal mode and on terminal focus-gained. The `D` binding runs the same call with `--daemonize`, which forks a daemon first if one isn't already running.
+- `shpool events` to subscribe to `shpool`'s events socket, so that `shperl` can refresh the table display at each event. Whenever the socket is unavailable, `shperl` falls back to refreshing upon keystrokes and terminal focus events.
+- `shpool list --json` for the table display. The `D` binding runs the same call with `--daemonize`, which forks a daemon first if one isn't already running.
 - `shpool attach <name>` for attach and create. `shperl` is stricter than `shpool` here because it checks if a session name already exists before creating it.
 - `shpool kill <name>` for kill.
