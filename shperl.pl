@@ -956,6 +956,12 @@ sub shell_kill {
 # error message if the action failed.
 sub finish_action {
     my ($m, $name, $ok, $err_msg) = @_;
+    # The user just completed an action — any stale-select state
+    # from before is no longer relevant. Cleared before the refresh
+    # so refresh_sessions can re-raise it if something new went
+    # away mid-action (the new alert wins over the irrelevant old).
+    $m->{stale_select} = 0;
+    $m->{error}        = undef;
     refresh_sessions($m);
     for my $i (0 .. $#{$m->{sessions}}) {
         if ($m->{sessions}[$i]{name} eq $name) {

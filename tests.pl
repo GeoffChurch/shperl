@@ -306,4 +306,72 @@ subtest 'model_advance_off is a no-op when target is not selected' => sub {
     is(main::model_selected_name($m), 'a', 'cursor unchanged');
 };
 
+# ---------------------------------------------------------------------------
+# finish_action: stale state from before the action shouldn't survive
+# its completion. The user has moved on.
+# ---------------------------------------------------------------------------
+
+# Wrap finish_action calls in a mock so refresh_sessions doesn't
+# shell out to a real shpool. The closure populates whatever the
+# caller wants the post-refresh sessions to look like.
+sub with_mocked_refresh (&;$) {
+    my ($body, $sessions) = @_;
+    no warnings 'redefine';
+    local *main::refresh_sessions = sub {
+        my $m = shift;
+        $m->{sessions} = $sessions if defined $sessions;
+    };
+    $body->();
+}
+
+subtest 'finish_action clears prior stale_select when target exists' => sub {
+    my $m = main::model_new();
+    $m->{sessions}     = [ session_record('bar', 200) ];
+    $m->{selected}     = 0;
+    $m->{stale_select} = 1;
+    $m->{error}        = "session 'foo' is gone";
+    with_mocked_refresh(sub {
+        main::finish_action($m, 'newbar', 1, undef);
+    }, [
+        session_record('newbar', 400),
+        session_record('bar',    200),
+    ]);
+    is($m->{stale_select}, 0,        'stale_select cleared');
+    is($m->{error},        undef,    'old error cleared');
+    is(main::model_selected_name($m), 'newbar', 'cursor on new session');
+};
+
+subtest 'finish_action with failure sets new error, still clears stale' => sub {
+    my $m = main::model_new();
+    $m->{sessions}     = [ session_record('bar', 200) ];
+    $m->{selected}     = 0;
+    $m->{stale_select} = 1;
+    $m->{error}        = "session 'foo' is gone";
+    with_mocked_refresh(sub {
+        main::finish_action($m, 'newbar', 0, 'shpool attach newbar failed');
+    }, [ session_record('bar', 200) ]);   # newbar not created
+    is($m->{stale_select}, 0, 'stale_select cleared');
+    is($m->{error}, 'shpool attach newbar failed',
+        'fresh action-failure error replaces the old stale one');
+};
+
+subtest 'finish_action lets the refresh re-raise stale_select for new losses' => sub {
+    my $m = main::model_new();
+    $m->{sessions}     = [ session_record('foo', 300), session_record('bar', 200) ];
+    $m->{selected}     = 0;   # on foo
+    $m->{stale_select} = 0;   # no prior stale state
+    {
+        no warnings 'redefine';
+        local *main::refresh_sessions = sub {
+            my $m = shift;
+            # Simulate: foo vanished mid-action while we were doing
+            # something else (kill bar, in this case).
+            main::model_refresh($m, [ session_record('baz', 400) ]);
+        };
+        main::finish_action($m, 'bar', 1, undef);
+    }
+    is($m->{stale_select}, 1, 'fresh stale fired (foo went away mid-action)');
+    like($m->{error}, qr/foo/, 'fresh error mentions the lost session');
+};
+
 done_testing();
