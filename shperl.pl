@@ -787,18 +787,19 @@ sub render {
         }
     }
 
+    # Modal prompts take precedence over errors: the user is
+    # mid-interaction (typing a name, confirming a kill, ...) and
+    # replacing their prompt with an error message — including one
+    # raised by a background refresh about an unrelated session —
+    # hides their typed input and turns the next Enter into a
+    # commit-while-blind. The error stays on the model and surfaces
+    # the next time we're in normal mode.
     my $bottom;
-    if (defined $m->{error}) {
-        $bottom = error_label($m->{error});
-    } elsif ($m->{mode} eq 'normal') {
-        $bottom = normal_bindings_label();
-    } elsif ($m->{mode} eq 'create') {
-        $bottom = create_input_label($m->{mode_data});
-    } elsif ($m->{mode} eq 'confirm_force') {
-        $bottom = confirm_force_label($m->{mode_data});
-    } else {
-        $bottom = confirm_kill_label($m->{mode_data});
-    }
+    if    ($m->{mode} eq 'create')        { $bottom = create_input_label($m->{mode_data}); }
+    elsif ($m->{mode} eq 'confirm_force') { $bottom = confirm_force_label($m->{mode_data}); }
+    elsif ($m->{mode} eq 'kill')          { $bottom = confirm_kill_label($m->{mode_data}); }
+    elsif (defined $m->{error})           { $bottom = error_label($m->{error}); }
+    else                                  { $bottom = normal_bindings_label(); }
     $out .= render_bar($w, $bottom, 'left');
 
     return $out;

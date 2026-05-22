@@ -190,4 +190,48 @@ subtest 'model_refresh clears stale_select when prev_name reappears via navigati
     is($m->{stale_select}, 0, 'flag stays cleared on subsequent refresh hit');
 };
 
+# Strip ANSI CSI sequences so substring matches work against the
+# rendered text. label_push_* chunks reset between segments, so e.g.
+# `kill "foo"` lands in the output as `kill <reset>"foo"` and a
+# naive regex would miss it.
+sub strip_ansi { my $s = shift; $s =~ s/\e\[[\d;?]*[a-zA-Z]//g; return $s }
+
+# ---------------------------------------------------------------------------
+# render: modal prompts outrank errors so a background refresh that
+# raises an error mid-input doesn't clobber the user's typing
+# ---------------------------------------------------------------------------
+
+subtest 'create modal prompt is shown even when an error is set' => sub {
+    my $m = make_model();
+    $m->{mode}      = 'create';
+    $m->{mode_data} = 'my_typed_input';
+    $m->{error}     = "session 'foo' is gone";
+    my $out = strip_ansi( main::render($m, 80, 24) );
+    like($out,   qr/my_typed_input/, 'typed input visible');
+    unlike($out, qr/foo' is gone/,   'error not shown over the prompt');
+};
+
+subtest 'confirm modals also outrank errors' => sub {
+    for my $case (
+        [ kill          => qr/kill "foo"/ ],
+        [ confirm_force => qr/"foo" already attached/ ],
+    ) {
+        my ($mode, $expect) = @$case;
+        my $m = make_model();
+        $m->{mode}      = $mode;
+        $m->{mode_data} = 'foo';
+        $m->{error}     = "background error msg";
+        my $out = strip_ansi( main::render($m, 80, 24) );
+        like($out,   $expect,                  "$mode prompt visible");
+        unlike($out, qr/background error msg/, "$mode hides the error");
+    }
+};
+
+subtest 'normal mode still shows errors' => sub {
+    my $m = make_model();
+    $m->{error} = "session 'foo' is gone";
+    my $out = strip_ansi( main::render($m, 80, 24) );
+    like($out, qr/foo' is gone/, 'error visible in normal mode');
+};
+
 done_testing();
