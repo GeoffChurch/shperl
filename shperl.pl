@@ -749,89 +749,98 @@ sub clip_plain {
     return substr($s, 0, $max);
 }
 
-sub render {
-    my ($m, $w, $h) = @_;
-    my $out = '';
-
-    # Clear + home.
-    $out .= "\e[2J\e[H";
-
-    $out .= render_bar($w, title_label($m), 'center');
-
-    # Name column grows to fit the longest name, floored at len("name").
-    my $name_width = 4;                # len("name")
-    for my $s (@{$m->{sessions}}) {
+# Widest session name, floored at len("name") so the header line is
+# always at least as wide as its own label.
+sub name_column_width {
+    my $sessions = shift;
+    my $w = 4;     # len("name")
+    for my $s (@$sessions) {
         my $len = length $s->{name};
-        $name_width = $len if $len > $name_width;
+        $w = $len if $len > $w;
     }
-    my $created_width = length $COL_CREATED;
-    my $active_width  = length $COL_ACTIVE;
-    my $gap = ' ' x $COL_GAP;
+    return $w;
+}
 
+sub header_row {
+    my ($w, $name_width) = @_;
+    my $gap = ' ' x $COL_GAP;
     my $header = clip_plain(
         sprintf("  %-*s%s%-*s%s%-*s",
-            $name_width,    'name',
+            $name_width,           'name',
             $gap,
-            $created_width, $COL_CREATED,
+            length($COL_CREATED),  $COL_CREATED,
             $gap,
-            $active_width,  $COL_ACTIVE),
+            length($COL_ACTIVE),   $COL_ACTIVE),
         $w,
     );
-    $out .= sprintf("%s%s%-*s%s\r\n",
+    return sprintf("%s%s%-*s%s\r\n",
         $SGR_BAR_BG, $SGR_AMBER_DIM, $w, $header, $SGR_RESET);
+}
 
+# Format one row of the session list. 2-char prefix is [attached
+# marker][selected arrow]: asterisk for sessions attached elsewhere
+# (so the user sees the state without having to hit Enter and get
+# the pre-flight rejection), '>' for the highlighted row. ASCII so
+# we don't depend on the terminal's locale/font.
+sub session_row {
+    my ($s, $is_selected, $name_width, $now, $w) = @_;
+    my $gap     = ' ' x $COL_GAP;
+    my $dot     = $s->{attached} ? '*' : ' ';
+    my $arrow   = $is_selected   ? '>' : ' ';
+    my $created = format_age($now, $s->{started_at_unix_ms} // 0);
+    my $active  = format_age($now, last_touched_ms($s));
+    my $text = clip_plain(
+        sprintf("%s%s%-*s%s%-*s%s%-*s",
+            $dot, $arrow,
+            $name_width,           $s->{name},
+            $gap,
+            length($COL_CREATED),  $created,
+            $gap,
+            length($COL_ACTIVE),   $active),
+        $w,
+    );
+    return $is_selected
+        ? sprintf("%s%-*s%s\r\n", $SGR_SELECTED, $w, $text, $SGR_RESET)
+        : sprintf("%-*s\r\n", $w, $text);
+}
+
+# Bottom-bar contents. Modal prompts outrank errors: the user is
+# mid-interaction (typing a name, confirming a kill, ...) and
+# replacing their prompt with an error message — including one
+# raised by a background refresh about an unrelated session — hides
+# their typed input and turns the next Enter into a commit-while-
+# blind. The error stays on the model and surfaces the next time
+# we're in normal mode.
+sub bottom_bar_label {
+    my $m = shift;
+    return create_input_label($m->{mode_data})  if $m->{mode} eq 'create';
+    return confirm_force_label($m->{mode_data}) if $m->{mode} eq 'confirm_force';
+    return confirm_kill_label($m->{mode_data})  if $m->{mode} eq 'kill';
+    return error_label($m->{error})             if defined $m->{error};
+    return normal_bindings_label();
+}
+
+sub render {
+    my ($m, $w, $h) = @_;
+    my $out = "\e[2J\e[H";                              # clear + home
+    $out .= render_bar($w, title_label($m), 'center');
+    my $name_width = name_column_width($m->{sessions});
+    $out .= header_row($w, $name_width);
     if (!@{$m->{sessions}}) {
         $out .= "  (no sessions)\r\n";
     } else {
         my $now = now_unix_ms();
         my $max_visible = $h - $CHROME_LINES;
         $max_visible = 0 if $max_visible < 0;
-        my ($start, $end) = viewport(scalar @{$m->{sessions}}, $m->{selected}, $max_visible);
+        my ($start, $end) = viewport(
+            scalar @{$m->{sessions}}, $m->{selected}, $max_visible);
         for my $i ($start .. $end - 1) {
-            my $s = $m->{sessions}[$i];
-            # 2-char prefix: [attached marker][selected arrow]. An
-            # asterisk marks sessions attached elsewhere so the user
-            # sees the state without having to hit Enter and get the
-            # pre-flight rejection. ASCII so we don't depend on the
-            # terminal's locale/font.
             my $is_selected = !$m->{stale_select} && $i == $m->{selected};
-            my $dot   = $s->{attached} ? '*' : ' ';
-            my $arrow = $is_selected   ? '>' : ' ';
-            my $created = format_age($now, $s->{started_at_unix_ms} // 0);
-            my $active  = format_age($now, last_touched_ms($s));
-            my $text = clip_plain(
-                sprintf("%s%s%-*s%s%-*s%s%-*s",
-                    $dot, $arrow,
-                    $name_width,    $s->{name},
-                    $gap,
-                    $created_width, $created,
-                    $gap,
-                    $active_width,  $active),
-                $w,
-            );
-            if ($is_selected) {
-                $out .= sprintf("%s%-*s%s\r\n", $SGR_SELECTED, $w, $text, $SGR_RESET);
-            } else {
-                $out .= sprintf("%-*s\r\n", $w, $text);
-            }
+            $out .= session_row(
+                $m->{sessions}[$i], $is_selected, $name_width, $now, $w);
         }
     }
-
-    # Modal prompts take precedence over errors: the user is
-    # mid-interaction (typing a name, confirming a kill, ...) and
-    # replacing their prompt with an error message — including one
-    # raised by a background refresh about an unrelated session —
-    # hides their typed input and turns the next Enter into a
-    # commit-while-blind. The error stays on the model and surfaces
-    # the next time we're in normal mode.
-    my $bottom;
-    if    ($m->{mode} eq 'create')        { $bottom = create_input_label($m->{mode_data}); }
-    elsif ($m->{mode} eq 'confirm_force') { $bottom = confirm_force_label($m->{mode_data}); }
-    elsif ($m->{mode} eq 'kill')          { $bottom = confirm_kill_label($m->{mode_data}); }
-    elsif (defined $m->{error})           { $bottom = error_label($m->{error}); }
-    else                                  { $bottom = normal_bindings_label(); }
-    $out .= render_bar($w, $bottom, 'left');
-
+    $out .= render_bar($w, bottom_bar_label($m), 'left');
     return $out;
 }
 

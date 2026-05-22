@@ -197,6 +197,44 @@ subtest 'model_refresh clears stale_select when prev_name reappears via navigati
 sub strip_ansi { my $s = shift; $s =~ s/\e\[[\d;?]*[a-zA-Z]//g; return $s }
 
 # ---------------------------------------------------------------------------
+# bottom_bar_label: priority is modal > error > bindings
+# ---------------------------------------------------------------------------
+
+# Label is [styled_bytes, visible_chars]; strip ANSI from the bytes
+# for substring matching.
+sub label_text { strip_ansi($_[0][0]) }
+
+subtest 'bottom_bar_label picks modal prompt over an error' => sub {
+    for my $case (
+        [ create        => 'foo' => qr/new session: foo/ ],
+        [ kill          => 'foo' => qr/kill "foo"/        ],
+        [ confirm_force => 'foo' => qr/"foo" already attached/ ],
+    ) {
+        my ($mode, $data, $expect) = @$case;
+        my $m = make_model();
+        $m->{mode}      = $mode;
+        $m->{mode_data} = $data;
+        $m->{error}     = "background error msg";
+        my $text = label_text( main::bottom_bar_label($m) );
+        like($text,   $expect,                  "$mode prompt selected");
+        unlike($text, qr/background error msg/, "$mode hides the error");
+    }
+};
+
+subtest 'bottom_bar_label falls back to error in normal mode' => sub {
+    my $m = make_model();
+    $m->{error} = "something went wrong";
+    my $text = label_text( main::bottom_bar_label($m) );
+    like($text, qr/something went wrong/, 'error shown');
+};
+
+subtest 'bottom_bar_label falls back to bindings when no error' => sub {
+    my $m = make_model();
+    my $text = label_text( main::bottom_bar_label($m) );
+    like($text, qr/quit/, 'normal bindings shown');
+};
+
+# ---------------------------------------------------------------------------
 # render: modal prompts outrank errors so a background refresh that
 # raises an error mid-input doesn't clobber the user's typing
 # ---------------------------------------------------------------------------
