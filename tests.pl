@@ -450,4 +450,96 @@ subtest 'next_render_delay_ms is undef for an empty list' => sub {
         'nothing to tick — block forever');
 };
 
+# ---------------------------------------------------------------------------
+# Template variables: parsing + the attachment preview (PR #379)
+# ---------------------------------------------------------------------------
+
+subtest 'template_vars extracts {name} tokens, deduped, in order' => sub {
+    is_deeply([ main::template_vars('{workspace}-edit') ], ['workspace'], 'single var');
+    is_deeply([ main::template_vars('{a}-{b}-{a}') ], ['a','b'], 'dedup, first-seen order');
+    is_deeply([ main::template_vars('plainsess') ], [], 'no vars');
+};
+
+subtest 'resolve_template substitutes known vars, leaves unknown literal' => sub {
+    my $vars = { workspace => 'newproj', editor => 'vim' };
+    is(main::resolve_template('{workspace}-edit', $vars), 'newproj-edit', 'known var');
+    is(main::resolve_template('{workspace}-{editor}', $vars), 'newproj-vim', 'two vars');
+    is(main::resolve_template('{gone}-x', $vars), '{gone}-x', 'unknown left as-is');
+};
+
+sub vars_sessions {
+    return [
+        { name => 'myproj-edit', attachments => [
+            { session_name_template => '{workspace}-edit', pid => 111 } ] },
+        { name => 'myproj-term', attachments => [
+            { session_name_template => '{workspace}-term', pid => 222 } ] },
+        { name => 'vim-notes', attachments => [
+            { session_name_template => '{editor}-notes', pid => 333 } ] },
+        { name => 'plainsess', attachments => [
+            { session_name_template => 'plainsess', pid => 444 } ] },
+    ];
+}
+
+subtest 'attachments_for_var finds only attachments referencing the var' => sub {
+    my @hits = main::attachments_for_var(vars_sessions(), 'workspace');
+    is(scalar @hits, 2, 'two attachments use {workspace}');
+    is_deeply([ sort map { $_->{session} } @hits ],
+        ['myproj-edit','myproj-term'], 'the right sessions');
+    is_deeply([ sort { $a <=> $b } map { $_->{pid} } @hits ], [111,222], 'with their pids');
+    is(scalar main::attachments_for_var(vars_sessions(), 'editor'), 1, 'editor governs one');
+    is(scalar main::attachments_for_var(vars_sessions(), 'nope'), 0, 'unknown governs none');
+};
+
+sub make_vars_model {
+    my $m = main::model_new();
+    $m->{mode}     = 'vars';
+    $m->{vlist}    = [ { name => 'editor', value => 'vim' },
+                       { name => 'workspace', value => 'myproj' } ];
+    $m->{vsel}     = 0;
+    $m->{sessions} = vars_sessions();
+    return $m;
+}
+
+subtest 'vars browse: j/k move the cursor and wrap' => sub {
+    my $m = make_vars_model();
+    main::process_vars_input([ [byte=>ord 'j'] ], $m);
+    is($m->{vsel}, 1, 'j moves down');
+    main::process_vars_input([ [byte=>ord 'j'] ], $m);
+    is($m->{vsel}, 0, 'j wraps to top');
+    main::process_vars_input([ [byte=>ord 'k'] ], $m);
+    is($m->{vsel}, 1, 'k wraps to bottom');
+};
+
+subtest 'vars edit: e opens the value line prefilled; chars + Enter commit' => sub {
+    my $m = make_vars_model();        # vsel 0 = editor=vim
+    main::process_vars_input([ [byte=>ord 'e'] ], $m);
+    is($m->{vedit}, 1, 'edit started');
+    is($m->{vinput}, 'vim', 'prefilled with the current value');
+    main::process_vars_input([ map { [byte=>0x7f] } 1..3 ], $m);
+    is($m->{vinput}, '', 'backspaced to empty');
+    main::process_vars_input([ map { [byte=>ord $_] } split //, 'nano' ], $m);
+    is($m->{vinput}, 'nano', 'typed new value');
+    my $action = main::process_vars_input([ [byte=>0x0d] ], $m);
+    is_deeply($action, [ 'var_set', 'editor', 'nano' ], 'Enter commits a var_set action');
+};
+
+subtest 'vars edit: Esc cancels the edit but stays in the view' => sub {
+    my $m = make_vars_model();
+    main::process_vars_input([ [byte=>ord 'e'] ], $m);
+    main::process_vars_input([ [byte=>ord 'x'] ], $m);
+    is($m->{vinput}, 'vimx', 'typed into the edit line');
+    main::process_vars_input([ ['bare_esc'] ], $m);
+    is($m->{vedit}, 0, 'edit cancelled');
+    is($m->{mode}, 'vars', 'still in the vars view');
+};
+
+subtest 'vars browse: Esc and q both leave the view' => sub {
+    my $m = make_vars_model();
+    main::process_vars_input([ ['bare_esc'] ], $m);
+    is($m->{mode}, 'normal', 'Esc returns to the session list');
+    my $m2 = make_vars_model();
+    main::process_vars_input([ [byte=>ord 'q'] ], $m2);
+    is($m2->{mode}, 'normal', 'q returns to the session list');
+};
+
 done_testing();

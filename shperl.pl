@@ -107,6 +107,7 @@ my @NORMAL_BINDINGS = (
     ]},
     { label => 'd', desc => 'kill', maps => [ [ ['byte', ord 'd'], 'KillSession' ] ]},
     { label => 'D', desc => 'daemon', maps => [ [ ['byte', ord 'D'], 'EnsureDaemon' ] ]},
+    { label => 'v', desc => 'vars', maps => [ [ ['byte', ord 'v'], 'Variables' ] ]},
     { label => 'q', desc => 'quit', maps => [
         [ ['byte', ord 'q'], 'Quit' ],
         [ ['byte', ord 'Q'], 'Quit' ],
@@ -169,6 +170,59 @@ sub fetch_sessions {
     return $sessions;
 }
 
+# The daemon's template variables, via `shpool var list` (one
+# "name<TAB>value" line each). Returns an arrayref of { name, value }
+# sorted by name. Dies on spawn/exit failure like fetch_sessions.
+sub fetch_vars {
+    open my $fh, '-|', 'shpool', @SHPOOL_FLAGS, 'var', 'list'
+        or die "spawning shpool var list: $!\n";
+    my @vars;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next unless length $line;
+        my ($name, $value) = split /\t/, $line, 2;
+        push @vars, { name => $name, value => $value // '' };
+    }
+    close $fh;
+    die "`shpool var list` failed\n" if $? != 0;
+    return [ sort { $a->{name} cmp $b->{name} } @vars ];
+}
+
+# Variable names referenced by a session-name template: each {name}
+# token, in first-seen order, de-duplicated. "{a}-{b}-{a}" -> ('a','b').
+sub template_vars {
+    my $tmpl = shift // '';
+    my (@names, %seen);
+    while ($tmpl =~ /\{(\w+)\}/g) {
+        push @names, $1 unless $seen{$1}++;
+    }
+    return @names;
+}
+
+# Resolve a template against a { name => value } map: each {name}
+# becomes its value; an unknown var is left as the literal {name}.
+sub resolve_template {
+    my ($tmpl, $vars) = @_;
+    (my $out = $tmpl // '') =~ s/\{(\w+)\}/exists $vars->{$1} ? $vars->{$1} : "{$1}"/ge;
+    return $out;
+}
+
+# Attachments across all sessions whose template references $var — the
+# set that would re-dial if $var changed. Each hit records the session
+# it currently resolves to, the template, and the attach-proc pid.
+sub attachments_for_var {
+    my ($sessions, $var) = @_;
+    my @hits;
+    for my $s (@$sessions) {
+        for my $a (@{$s->{attachments} // []}) {
+            my $tmpl = $a->{session_name_template} // '';
+            next unless grep { $_ eq $var } template_vars($tmpl);
+            push @hits, { session => $s->{name}, template => $tmpl, pid => $a->{pid} };
+        }
+    }
+    return @hits;
+}
+
 # Latest timestamp on the session — includes started_at so a
 # brand-new session sorts as recent even before any connect/detach.
 sub last_touched_ms {
@@ -193,12 +247,18 @@ sub model_new {
         # concurrent session creation can't quietly revalidate a stale
         # index.
         stale_select => 0,
-        mode         => 'normal',    # normal | create | kill | confirm_force
+        mode         => 'normal',    # normal | create | kill | confirm_force | vars
         mode_data    => '',          # create: partial name; kill/confirm_force: target name
         error        => undef,
         parser_state => 'normal',    # normal | esc | esc_bracket
         events_pid   => undef,       # `shpool events` child pid, or undef
         events_fh    => undef,       # read end of its stdout pipe, or undef
+        # vars mode: the daemon's template variables and the cursor into
+        # them. vedit toggles the value-entry line; vinput accumulates it.
+        vlist        => [],          # [ { name, value }, ... ] sorted by name
+        vsel         => 0,           # selected index into vlist
+        vedit        => 0,           # 1 while typing a new value
+        vinput       => '',          # the in-progress value while vedit
     };
 }
 
@@ -365,6 +425,7 @@ sub process_input {
     return process_create_input(\@keep, $m)                    if $m->{mode} eq 'create';
     return process_yn_confirm(\@keep, $m, 'kill')              if $m->{mode} eq 'kill';
     return process_yn_confirm(\@keep, $m, 'attach_force')      if $m->{mode} eq 'confirm_force';
+    return process_vars_input(\@keep, $m)                      if $m->{mode} eq 'vars';
     return undef;
 }
 
@@ -412,8 +473,41 @@ my %NORMAL_HANDLERS = (
         return undef;
     },
     EnsureDaemon => sub { [ 'ensure_daemon' ] },
+    Variables    => sub { enter_vars_mode($_[0]); undef },
     Quit         => sub { [ 'quit' ] },
 );
+
+# Enter the template-variable view: snapshot `shpool var list` into the
+# model and reset the cursor. On a list failure, park the error and stay
+# in normal mode rather than opening an empty view.
+sub enter_vars_mode {
+    my $m = shift;
+    my $vars = eval { fetch_vars() };
+    if ($@) {
+        (my $e = $@) =~ s/^\s+|\s+$//g;
+        model_set_error($m, "shpool var list: $e");
+        return;
+    }
+    $m->{vlist}  = $vars;
+    $m->{vsel}   = 0;
+    $m->{vedit}  = 0;
+    $m->{vinput} = '';
+    $m->{mode}   = 'vars';
+}
+
+sub leave_vars_mode {
+    my $m = shift;
+    $m->{mode}   = 'normal';
+    $m->{vedit}  = 0;
+    $m->{vinput} = '';
+}
+
+sub vars_select {
+    my ($m, $dir) = @_;
+    my $n = scalar @{$m->{vlist}};
+    return unless $n;
+    $m->{vsel} = ($m->{vsel} + $dir) % $n;
+}
 
 sub process_normal {
     my ($tokens, $m) = @_;
@@ -472,6 +566,55 @@ sub process_create_input {
             # Printable non-space ASCII (shpool rejects whitespace).
             $m->{mode_data} .= chr($b);
         }
+    }
+    return undef;
+}
+
+# Template-variable view. Two sub-states keyed off vedit:
+#   browsing — j/k move the cursor; e/Enter open the value line; Esc/q
+#              (or ^C) return to the session list.
+#   editing  — printable bytes accumulate in vinput; Enter commits a
+#              ['var_set', name, value] action (run inline by event_loop,
+#              which re-fetches vars + sessions so the preview updates);
+#              Esc/^C abandon the edit. csi (arrows) ignored either way.
+sub process_vars_input {
+    my ($tokens, $m) = @_;
+    for my $t (@$tokens) {
+        if ($m->{vedit}) {
+            if ($t->[0] eq 'bare_esc') { $m->{vedit} = 0; $m->{vinput} = ''; next; }
+            next if $t->[0] eq 'csi';
+            my $b = $t->[1];
+            if ($b == 0x03) { $m->{vedit} = 0; $m->{vinput} = ''; next; }
+            elsif ($b == 0x0d || $b == 0x0a) {
+                return [ 'var_set', $m->{vlist}[$m->{vsel}]{name}, $m->{vinput} ];
+            }
+            elsif ($b == 0x7f || $b == 0x08) {
+                $m->{vinput} = substr($m->{vinput}, 0, -1) if length $m->{vinput};
+            }
+            elsif ($b >= 0x20 && $b <= 0x7e) {    # printable (values may hold spaces)
+                $m->{vinput} .= chr($b);
+            }
+            next;
+        }
+        # browsing
+        if ($t->[0] eq 'bare_esc') { leave_vars_mode($m); return undef; }
+        if ($t->[0] eq 'csi') {
+            vars_select($m,  1) if $t->[1] == ord 'B';
+            vars_select($m, -1) if $t->[1] == ord 'A';
+            next;
+        }
+        my $b = $t->[1];
+        if ($b == 0x03 || $b == ord 'q') { leave_vars_mode($m); return undef; }
+        elsif ($b == ord 'j' || $b == ord 'J') { vars_select($m,  1); }
+        elsif ($b == ord 'k' || $b == ord 'K') { vars_select($m, -1); }
+        elsif ($b == 0x0d || $b == 0x0a || $b == ord 'e') {
+            # Open the value line, prefilled with the current value.
+            if (@{$m->{vlist}}) {
+                $m->{vedit}  = 1;
+                $m->{vinput} = $m->{vlist}[$m->{vsel}]{value};
+            }
+        }
+        # other keys ignored — stay in the view
     }
     return undef;
 }
@@ -648,6 +791,35 @@ sub confirm_force_label {
     label_push_plain($l, ' already attached. force-attach?   (');
     push_hints($l, [ [ 'y', 'force' ], [ 'n', 'cancel' ] ]);
     label_push_plain($l, ')');
+    return $l;
+}
+
+sub vars_title_label {
+    my $m = shift;
+    my $n = scalar @{$m->{vlist}};
+    my $l = label_new();
+    label_push_key($l, "variables ($n)");
+    return $l;
+}
+
+# Vars-view bottom bar. The value-entry line outranks an error (same
+# rule as the session view's modals); otherwise show the key hints.
+sub vars_bottom_label {
+    my $m = shift;
+    if ($m->{vedit}) {
+        my $l = label_new();
+        label_push_plain($l, 'set ');
+        label_push_key($l,   $m->{vlist}[$m->{vsel}]{name});
+        label_push_plain($l, ' = ');
+        label_push_key($l,   $m->{vinput});
+        label_push_plain($l, '_   (');
+        push_hints($l, [ [ 'ret', 'apply' ], [ 'esc', 'cancel' ] ]);
+        label_push_plain($l, ')');
+        return $l;
+    }
+    return error_label($m->{error}) if defined $m->{error};
+    my $l = label_new();
+    push_hints($l, [ [ 'j/k', 'select' ], [ 'e', 'set value' ], [ 'esc', 'back' ] ]);
     return $l;
 }
 
@@ -857,6 +1029,7 @@ sub bottom_bar_label {
 
 sub render {
     my ($m, $w, $h) = @_;
+    return render_vars($m, $w, $h) if $m->{mode} eq 'vars';
     my $out = "\e[2J\e[H";                              # clear + home
     $out .= render_bar($w, title_label($m), 'center');
     my $name_width = name_column_width($m->{sessions});
@@ -876,6 +1049,69 @@ sub render {
         }
     }
     $out .= render_bar($w, bottom_bar_label($m), 'left');
+    return $out;
+}
+
+# Template-variable view: the variable list with a cursor, plus a live
+# preview of which attachments the selected variable governs — and,
+# while editing, what each would re-dial to under the typed value. This
+# is the payoff of list --json's attachments[].session_name_template:
+# the resolved session name alone can't tell you which variable spawned
+# it, so without the template there's nothing to preview.
+sub render_vars {
+    my ($m, $w, $h) = @_;
+    my $out = "\e[2J\e[H";
+    $out .= render_bar($w, vars_title_label($m), 'center');
+
+    my $vlist = $m->{vlist};
+    my @lines;
+    if (!@$vlist) {
+        push @lines, '  (no variables — shpool var set NAME VALUE)';
+    } else {
+        my $nw = 0;
+        for my $v (@$vlist) { my $n = length $v->{name}; $nw = $n if $n > $nw; }
+        for my $i (0 .. $#$vlist) {
+            my $v     = $vlist->[$i];
+            my $arrow = $i == $m->{vsel} ? '>' : ' ';
+            my $count = scalar attachments_for_var($m->{sessions}, $v->{name});
+            my $row = clip_plain(
+                sprintf(' %s %-*s = %s   (%d session%s)',
+                    $arrow, $nw, $v->{name}, $v->{value},
+                    $count, $count == 1 ? '' : 's'),
+                $w);
+            push @lines, $i == $m->{vsel}
+                ? sprintf('%s%-*s%s', $SGR_SELECTED, $w, $row, $SGR_RESET)
+                : $row;
+        }
+
+        my $sel  = $vlist->[$m->{vsel}];
+        my @hits = attachments_for_var($m->{sessions}, $sel->{name});
+        # While editing, resolve against the typed value so each row
+        # shows its prospective re-dial target.
+        my %vmap = map { $_->{name} => $_->{value} } @$vlist;
+        $vmap{$sel->{name}} = $m->{vinput} if $m->{vedit};
+        push @lines, '';
+        if (@hits) {
+            push @lines, sprintf('  %s governs %d attachment%s:',
+                $sel->{name}, scalar @hits, @hits == 1 ? '' : 's');
+            for my $a (@hits) {
+                my $after = resolve_template($a->{template}, \%vmap);
+                my $row = sprintf('    %-24s %-16s pid %s',
+                    $a->{template}, $a->{session}, $a->{pid});
+                $row .= "  -> $after" if $m->{vedit} && $after ne $a->{session};
+                push @lines, clip_plain($row, $w);
+            }
+        } else {
+            push @lines, '  (no attachments reference this variable)';
+        }
+    }
+
+    my $body_rows = $h - 2;             # title bar + bottom bar
+    if    ($body_rows <= 0)        { @lines = (); }
+    elsif (@lines > $body_rows)    { @lines = @lines[0 .. $body_rows - 1]; }
+    $out .= "$_\r\n" for @lines;
+
+    $out .= render_bar($w, vars_bottom_label($m), 'left');
     return $out;
 }
 
@@ -1126,6 +1362,26 @@ sub event_loop {
                 if ($action->[0] eq 'ensure_daemon') {
                     refresh_sessions($m, '--daemonize');
                     ensure_events($m);
+                    next;
+                }
+                # Set a template variable and stay in the vars view. The
+                # affected sessions re-dial in the daemon; re-fetching
+                # vars + sessions makes the preview reflect the new
+                # resolution at once (events then keep it current).
+                if ($action->[0] eq 'var_set') {
+                    my (undef, $vn, $vv) = @$action;
+                    my ($ok, $err) = run_capture_stderr(
+                        'shpool', @SHPOOL_FLAGS, 'var', 'set', $vn, $vv);
+                    $m->{vedit}  = 0;
+                    $m->{vinput} = '';
+                    if ($ok) {
+                        $m->{vlist} = eval { fetch_vars() } // $m->{vlist};
+                        refresh_sessions($m);
+                    } else {
+                        $err =~ s/^\s+|\s+$//g;
+                        model_set_error($m,
+                            length $err ? "var set $vn: $err" : "var set $vn failed");
+                    }
                     next;
                 }
                 return $action;
