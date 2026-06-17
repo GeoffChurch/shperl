@@ -727,6 +727,41 @@ sub format_age {
     return int($hours / 24) . 'd';
 }
 
+# Milliseconds until format_age would render a different string for a
+# value currently $age_ms old — the distance to the next bucket edge.
+# Mirrors format_age's thresholds so the two stay in lockstep.
+sub ms_until_age_changes {
+    my $age_ms = shift;
+    my $secs = int($age_ms / 1000);
+    return 5000     - $age_ms              if $secs < 5;      # "now" -> "5s"
+    return 1000     - $age_ms % 1000       if $secs < 60;     # next second
+    return 60000    - $age_ms % 60000      if $secs < 3600;   # next minute
+    return 3600000  - $age_ms % 3600000    if $secs < 86400;  # next hour
+    return 86400000 - $age_ms % 86400000;                     # next day
+}
+
+# Milliseconds until the soonest on-screen relative-age string would
+# change, or undef when there's nothing to tick (empty list). Drives the
+# select timeout so the "created"/"active" columns advance on their own
+# while the table is idle, without waking any more often than the
+# coarsest visible unit needs. Computed over every session — cheap, and
+# the youngest sets the cadence whether or not it's scrolled into view.
+# Floored at 100ms so a cluster of sessions straddling a boundary can't
+# provoke a flurry of sub-frame wakes.
+sub next_render_delay_ms {
+    my ($m, $now_ms) = @_;
+    my $min;
+    for my $s (@{$m->{sessions}}) {
+        for my $then ($s->{started_at_unix_ms} // 0, last_touched_ms($s)) {
+            my $age = $now_ms > $then ? $now_ms - $then : 0;
+            my $d   = ms_until_age_changes($age);
+            $min = $d if !defined $min || $d < $min;
+        }
+    }
+    return undef unless defined $min;
+    return $min < 100 ? 100 : $min;
+}
+
 # Visible window [start, end) that keeps the selection on screen.
 sub viewport {
     my ($total, $selected, $max_visible) = @_;
@@ -1034,9 +1069,17 @@ sub event_loop {
             $ev_fno = fileno($m->{events_fh});
             vec($rin, $ev_fno, 1) = 1;
         }
+        # Wake on input, a push event, or — so the relative-age columns
+        # advance while the table sits idle — when the soonest on-screen
+        # age would next change. undef blocks forever (empty list); a bare
+        # timeout wake finds nothing ready and loops back to re-render with
+        # a fresh clock, firing neither the events drain nor the keystroke
+        # fallback (both gated on their fd's bit).
+        my $delay_ms = next_render_delay_ms($m, now_unix_ms());
+        my $timeout  = defined $delay_ms ? $delay_ms / 1000 : undef;
         # select(2) writes the result mask into the input arg, so copy.
         my $rout = $rin;
-        my $nfound = select($rout, undef, undef, undef);
+        my $nfound = select($rout, undef, undef, $timeout);
         if ($nfound < 0) {
             next if $!{EINTR};      # SIGWINCH — re-render
             die "select: $!";

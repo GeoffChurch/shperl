@@ -412,4 +412,42 @@ subtest 'finish_action lets the refresh re-raise stale_select for new losses' =>
     like($m->{error}, qr/foo/, 'fresh error mentions the lost session');
 };
 
+# ---------------------------------------------------------------------------
+# next_render_delay_ms: idle wake cadence mirrors format_age's buckets
+# ---------------------------------------------------------------------------
+
+subtest 'next_render_delay_ms ticks per-second in the sub-minute band' => sub {
+    # 5.3s old: format_age shows "5s", flips to "6s" in 700ms.
+    my $m = { sessions => [ session_record('a', 4_700) ] };
+    is(main::next_render_delay_ms($m, 10_000), 700,
+        'next whole second, not a full 1000ms');
+};
+
+subtest 'next_render_delay_ms floors at 100ms near a boundary' => sub {
+    # 5.95s old: only 50ms to the next second — floored up to 100.
+    my $m = { sessions => [ session_record('a', 4_050) ] };
+    is(main::next_render_delay_ms($m, 10_000), 100, 'sub-100ms gap floored');
+};
+
+subtest 'next_render_delay_ms ticks per-minute in the Nm band' => sub {
+    # 100s old: "1m", flips to "2m" at 120s — 20s away.
+    my $m = { sessions => [ session_record('a', 100_000) ] };
+    is(main::next_render_delay_ms($m, 200_000), 20_000, 'next whole minute');
+};
+
+subtest 'next_render_delay_ms takes the soonest change across sessions' => sub {
+    # a is 1s old ("now", 4s until "5s"); b is 5.3s old (700ms until "6s").
+    # The faster ticker sets the cadence.
+    my $m = { sessions => [
+        session_record('a', 9_000),
+        session_record('b', 4_700),
+    ] };
+    is(main::next_render_delay_ms($m, 10_000), 700, 'min across all sessions');
+};
+
+subtest 'next_render_delay_ms is undef for an empty list' => sub {
+    is(main::next_render_delay_ms({ sessions => [] }, 10_000), undef,
+        'nothing to tick — block forever');
+};
+
 done_testing();
