@@ -542,4 +542,79 @@ subtest 'vars browse: Esc and q both leave the view' => sub {
     is($m2->{mode}, 'normal', 'q returns to the session list');
 };
 
+# ---------------------------------------------------------------------------
+# Golden full-frame render tests
+# ---------------------------------------------------------------------------
+# Normalize a frame for comparison: strip ANSI/cursor sequences and CRs,
+# rstrip each line, drop trailing blank lines. Leading spaces and interior
+# blanks are significant and preserved; trailing-space trimming keeps the
+# goldens robust to editor/diff whitespace munging.
+sub norm_frame {
+    my $s = shift // '';
+    $s =~ s/\e\[[\d;?]*[a-zA-Z]//g;
+    $s =~ s/\r//g;
+    my @l = split /\n/, $s, -1;
+    s/[ \t]+$// for @l;
+    pop @l while @l && $l[-1] eq '';
+    return join "\n", @l;
+}
+sub frame_is { is(norm_frame($_[0]), norm_frame($_[1]), $_[2]) }
+
+subtest 'golden: session list (clock mocked)' => sub {
+    no warnings qw(redefine once);
+    local *main::now_unix_ms = sub { 1_000_000_000 };
+    my $m = main::model_new();
+    main::model_refresh($m, [
+        { name => 'web', status => 'Attached', attached => 1,
+          started_at_unix_ms => 992_800_000,
+          last_connected_at_unix_ms => 999_995_000,
+          last_disconnected_at_unix_ms => 0 },
+        { name => 'db', status => 'Disconnected', attached => 0,
+          started_at_unix_ms => 996_400_000,
+          last_connected_at_unix_ms => 996_400_000,
+          last_disconnected_at_unix_ms => 999_400_000 },
+    ]);
+    $m->{selected} = 0;
+    frame_is(main::render($m, 76, 8), <<'GOLDEN', 'session list frame');
+                            shpool (2 sessions)
+  name  created  active
+*>web   2h       5s
+  db    1h       10m
+  j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
+GOLDEN
+};
+
+subtest 'golden: empty session list' => sub {
+    my $m = main::model_new();
+    frame_is(main::render($m, 76, 8), <<'GOLDEN', 'empty list frame');
+                            shpool (0 sessions)
+  name  created  active
+  (no sessions)
+  j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
+GOLDEN
+};
+
+subtest 'golden: vars view (browsing)' => sub {
+    my $m = main::model_new();
+    $m->{mode}  = 'vars';
+    $m->{vlist} = [ { name => 'editor', value => 'vim' },
+                    { name => 'workspace', value => 'myproj' } ];
+    $m->{vsel}  = 1;
+    $m->{sessions} = [
+        { name => 'myproj-edit', attachments => [ { session_name_template => '{workspace}-edit', pid => 111 } ] },
+        { name => 'myproj-term', attachments => [ { session_name_template => '{workspace}-term', pid => 222 } ] },
+        { name => 'vim-notes',   attachments => [ { session_name_template => '{editor}-notes',   pid => 333 } ] },
+    ];
+    frame_is(main::render($m, 72, 12), <<'GOLDEN', 'vars browsing frame');
+                             variables (2)
+   editor    = vim   (1 session)
+ > workspace = myproj   (2 sessions)
+
+  workspace governs 2 attachments:
+    {workspace}-edit         myproj-edit      pid 111
+    {workspace}-term         myproj-term      pid 222
+  j/k: select, e: set value, esc: back
+GOLDEN
+};
+
 done_testing();
