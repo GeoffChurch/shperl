@@ -9,16 +9,28 @@ A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel]
 ## What it looks like (colors/highlighting in terminal)
 
 ```
-                  shpool (3 sessions)
+                           shpool (3 sessions)
   name       created  active
- >acme -nw   2h       now
+*>acme -nw   2h       now
   stuxnet    2h       1m
 * djt-miner  1d       3h
-  j down   k up   spc attach   n new   d kill   D daemon   q quit
+  j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
 ```
 
 - `>` marks the selection.
 - `*` marks attached sessions.
+
+Press `v` to manage `shpool`'s template variables and their attached sessions.
+
+```
+                              variables (2)
+ > coin   = djt   (1 session)
+   editor = acme   (1 session)
+
+  {coin} attachments:
+    {coin}-miner             djt-miner        pid 4321  -> xmr-miner
+  set coin = xmr_   (ret: apply, esc: cancel)
+```
 
 ## Install
 
@@ -57,6 +69,7 @@ Keys:
 | `n`           | create new session (prompts for name)                     |
 | `d`           | kill selected session (confirm with `y`)                  |
 | `D`           | start `shpool` daemon if not running, then refresh        |
+| `v`           | manage `shpool` template variables                  |
 | `q` / `C-c`   | quit `shperl` (doesn't affect sessions)                   |
 
 Detaching from a `shpool` session (`C-S C-q`, or however you've configured it) returns you to `shperl`.
@@ -69,3 +82,4 @@ The session list also auto-refreshes when the terminal regains focus, so switchi
 - `shpool list --json` for the table display. The `D` binding runs the same call with `--daemonize`, which forks a daemon first if one isn't already running.
 - `shpool attach <name>` for attach and create. `shperl` is stricter than `shpool` here because it checks if a session name already exists before creating it.
 - `shpool kill <name>` for kill.
+- `shpool var list` / `shpool var set <name> <value>` for the `v` variables view.
