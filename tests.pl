@@ -493,9 +493,9 @@ subtest 'attachments_for_var finds only attachments referencing the var' => sub 
 sub make_vars_model {
     my $m = main::model_new();
     $m->{mode}     = 'vars';
-    $m->{vlist}    = [ { name => 'editor', value => 'vim' },
+    $m->{vars}{list}    = [ { name => 'editor', value => 'vim' },
                        { name => 'workspace', value => 'myproj' } ];
-    $m->{vsel}     = 0;
+    $m->{vars}{sel}     = 0;
     $m->{sessions} = vars_sessions();
     return $m;
 }
@@ -503,22 +503,22 @@ sub make_vars_model {
 subtest 'vars browse: j/k move the cursor and wrap' => sub {
     my $m = make_vars_model();
     main::process_vars_input([ [byte=>ord 'j'] ], $m);
-    is($m->{vsel}, 1, 'j moves down');
+    is($m->{vars}{sel}, 1, 'j moves down');
     main::process_vars_input([ [byte=>ord 'j'] ], $m);
-    is($m->{vsel}, 0, 'j wraps to top');
+    is($m->{vars}{sel}, 0, 'j wraps to top');
     main::process_vars_input([ [byte=>ord 'k'] ], $m);
-    is($m->{vsel}, 1, 'k wraps to bottom');
+    is($m->{vars}{sel}, 1, 'k wraps to bottom');
 };
 
 subtest 'vars edit: e opens the value line prefilled; chars + Enter commit' => sub {
-    my $m = make_vars_model();        # vsel 0 = editor=vim
+    my $m = make_vars_model();        # vars.sel 0 = editor=vim
     main::process_vars_input([ [byte=>ord 'e'] ], $m);
-    is($m->{vedit}, 1, 'edit started');
-    is($m->{vinput}, 'vim', 'prefilled with the current value');
+    is($m->{vars}{edit}, 1, 'edit started');
+    is($m->{vars}{input}, 'vim', 'prefilled with the current value');
     main::process_vars_input([ map { [byte=>0x7f] } 1..3 ], $m);
-    is($m->{vinput}, '', 'backspaced to empty');
+    is($m->{vars}{input}, '', 'backspaced to empty');
     main::process_vars_input([ map { [byte=>ord $_] } split //, 'nano' ], $m);
-    is($m->{vinput}, 'nano', 'typed new value');
+    is($m->{vars}{input}, 'nano', 'typed new value');
     my $action = main::process_vars_input([ [byte=>0x0d] ], $m);
     is_deeply($action, [ 'var_set', 'editor', 'nano' ], 'Enter commits a var_set action');
 };
@@ -527,9 +527,9 @@ subtest 'vars edit: Esc cancels the edit but stays in the view' => sub {
     my $m = make_vars_model();
     main::process_vars_input([ [byte=>ord 'e'] ], $m);
     main::process_vars_input([ [byte=>ord 'x'] ], $m);
-    is($m->{vinput}, 'vimx', 'typed into the edit line');
+    is($m->{vars}{input}, 'vimx', 'typed into the edit line');
     main::process_vars_input([ ['bare_esc'] ], $m);
-    is($m->{vedit}, 0, 'edit cancelled');
+    is($m->{vars}{edit}, 0, 'edit cancelled');
     is($m->{mode}, 'vars', 'still in the vars view');
 };
 
@@ -597,9 +597,9 @@ GOLDEN
 subtest 'golden: vars view (browsing)' => sub {
     my $m = main::model_new();
     $m->{mode}  = 'vars';
-    $m->{vlist} = [ { name => 'editor', value => 'vim' },
+    $m->{vars}{list} = [ { name => 'editor', value => 'vim' },
                     { name => 'workspace', value => 'myproj' } ];
-    $m->{vsel}  = 1;
+    $m->{vars}{sel}  = 1;
     $m->{sessions} = [
         { name => 'myproj-edit', attachments => [ { session_name_template => '{workspace}-edit', pid => 111 } ] },
         { name => 'myproj-term', attachments => [ { session_name_template => '{workspace}-term', pid => 222 } ] },

@@ -253,12 +253,14 @@ sub model_new {
         parser_state => 'normal',    # normal | esc | esc_bracket
         events_pid   => undef,       # `shpool events` child pid, or undef
         events_fh    => undef,       # read end of its stdout pipe, or undef
-        # vars mode: the daemon's template variables and the cursor into
-        # them. vedit toggles the value-entry line; vinput accumulates it.
-        vlist        => [],          # [ { name, value }, ... ] sorted by name
-        vsel         => 0,           # selected index into vlist
-        vedit        => 0,           # 1 while typing a new value
-        vinput       => '',          # the in-progress value while vedit
+        # vars mode (browsing/editing the daemon's template variables),
+        # grouped under one key so the view's state lives together.
+        vars         => {
+            list  => [],   # [ { name, value }, ... ] sorted by name
+            sel   => 0,    # selected index into list
+            edit  => 0,    # 1 while typing a new value
+            input => '',   # the in-progress value while editing
+        },
     };
 }
 
@@ -488,25 +490,25 @@ sub enter_vars_mode {
         model_set_error($m, "shpool var list: $e");
         return;
     }
-    $m->{vlist}  = $vars;
-    $m->{vsel}   = 0;
-    $m->{vedit}  = 0;
-    $m->{vinput} = '';
+    $m->{vars}{list}  = $vars;
+    $m->{vars}{sel}   = 0;
+    $m->{vars}{edit}  = 0;
+    $m->{vars}{input} = '';
     $m->{mode}   = 'vars';
 }
 
 sub leave_vars_mode {
     my $m = shift;
     $m->{mode}   = 'normal';
-    $m->{vedit}  = 0;
-    $m->{vinput} = '';
+    $m->{vars}{edit}  = 0;
+    $m->{vars}{input} = '';
 }
 
 sub vars_select {
     my ($m, $dir) = @_;
-    my $n = scalar @{$m->{vlist}};
+    my $n = scalar @{$m->{vars}{list}};
     return unless $n;
-    $m->{vsel} = ($m->{vsel} + $dir) % $n;
+    $m->{vars}{sel} = ($m->{vars}{sel} + $dir) % $n;
 }
 
 sub process_normal {
@@ -570,29 +572,29 @@ sub process_create_input {
     return undef;
 }
 
-# Template-variable view. Two sub-states keyed off vedit:
+# Template-variable view. Two sub-states keyed off vars.edit:
 #   browsing — j/k move the cursor; e/Enter open the value line; Esc/q
 #              (or ^C) return to the session list.
-#   editing  — printable bytes accumulate in vinput; Enter commits a
+#   editing  — printable bytes accumulate in vars.input; Enter commits a
 #              ['var_set', name, value] action (run inline by event_loop,
 #              which re-fetches vars + sessions so the preview updates);
 #              Esc/^C abandon the edit. csi (arrows) ignored either way.
 sub process_vars_input {
     my ($tokens, $m) = @_;
     for my $t (@$tokens) {
-        if ($m->{vedit}) {
-            if ($t->[0] eq 'bare_esc') { $m->{vedit} = 0; $m->{vinput} = ''; next; }
+        if ($m->{vars}{edit}) {
+            if ($t->[0] eq 'bare_esc') { $m->{vars}{edit} = 0; $m->{vars}{input} = ''; next; }
             next if $t->[0] eq 'csi';
             my $b = $t->[1];
-            if ($b == 0x03) { $m->{vedit} = 0; $m->{vinput} = ''; next; }
+            if ($b == 0x03) { $m->{vars}{edit} = 0; $m->{vars}{input} = ''; next; }
             elsif ($b == 0x0d || $b == 0x0a) {
-                return [ 'var_set', $m->{vlist}[$m->{vsel}]{name}, $m->{vinput} ];
+                return [ 'var_set', $m->{vars}{list}[$m->{vars}{sel}]{name}, $m->{vars}{input} ];
             }
             elsif ($b == 0x7f || $b == 0x08) {
-                $m->{vinput} = substr($m->{vinput}, 0, -1) if length $m->{vinput};
+                $m->{vars}{input} = substr($m->{vars}{input}, 0, -1) if length $m->{vars}{input};
             }
             elsif ($b >= 0x20 && $b <= 0x7e) {    # printable (values may hold spaces)
-                $m->{vinput} .= chr($b);
+                $m->{vars}{input} .= chr($b);
             }
             next;
         }
@@ -609,9 +611,9 @@ sub process_vars_input {
         elsif ($b == ord 'k' || $b == ord 'K') { vars_select($m, -1); }
         elsif ($b == 0x0d || $b == 0x0a || $b == ord 'e') {
             # Open the value line, prefilled with the current value.
-            if (@{$m->{vlist}}) {
-                $m->{vedit}  = 1;
-                $m->{vinput} = $m->{vlist}[$m->{vsel}]{value};
+            if (@{$m->{vars}{list}}) {
+                $m->{vars}{edit}  = 1;
+                $m->{vars}{input} = $m->{vars}{list}[$m->{vars}{sel}]{value};
             }
         }
         # other keys ignored — stay in the view
@@ -796,7 +798,7 @@ sub confirm_force_label {
 
 sub vars_title_label {
     my $m = shift;
-    my $n = scalar @{$m->{vlist}};
+    my $n = scalar @{$m->{vars}{list}};
     my $l = label_new();
     label_push_key($l, "variables ($n)");
     return $l;
@@ -806,12 +808,12 @@ sub vars_title_label {
 # rule as the session view's modals); otherwise show the key hints.
 sub vars_bottom_label {
     my $m = shift;
-    if ($m->{vedit}) {
+    if ($m->{vars}{edit}) {
         my $l = label_new();
         label_push_plain($l, 'set ');
-        label_push_key($l,   $m->{vlist}[$m->{vsel}]{name});
+        label_push_key($l,   $m->{vars}{list}[$m->{vars}{sel}]{name});
         label_push_plain($l, ' = ');
-        label_push_key($l,   $m->{vinput});
+        label_push_key($l,   $m->{vars}{input});
         label_push_plain($l, '_   (');
         push_hints($l, [ [ 'ret', 'apply' ], [ 'esc', 'cancel' ] ]);
         label_push_plain($l, ')');
@@ -1063,7 +1065,7 @@ sub render_vars {
     my $out = "\e[2J\e[H";
     $out .= render_bar($w, vars_title_label($m), 'center');
 
-    my $vlist = $m->{vlist};
+    my $vlist = $m->{vars}{list};
     my @lines;
     if (!@$vlist) {
         push @lines, '  (no variables — shpool var set NAME VALUE)';
@@ -1072,24 +1074,24 @@ sub render_vars {
         for my $v (@$vlist) { my $n = length $v->{name}; $nw = $n if $n > $nw; }
         for my $i (0 .. $#$vlist) {
             my $v     = $vlist->[$i];
-            my $arrow = $i == $m->{vsel} ? '>' : ' ';
+            my $arrow = $i == $m->{vars}{sel} ? '>' : ' ';
             my $count = scalar attachments_for_var($m->{sessions}, $v->{name});
             my $row = clip_plain(
                 sprintf(' %s %-*s = %s   (%d session%s)',
                     $arrow, $nw, $v->{name}, $v->{value},
                     $count, $count == 1 ? '' : 's'),
                 $w);
-            push @lines, $i == $m->{vsel}
+            push @lines, $i == $m->{vars}{sel}
                 ? sprintf('%s%-*s%s', $SGR_SELECTED, $w, $row, $SGR_RESET)
                 : $row;
         }
 
-        my $sel  = $vlist->[$m->{vsel}];
+        my $sel  = $vlist->[$m->{vars}{sel}];
         my @hits = attachments_for_var($m->{sessions}, $sel->{name});
         # While editing, resolve against the typed value so each row
         # shows its prospective re-dial target.
         my %vmap = map { $_->{name} => $_->{value} } @$vlist;
-        $vmap{$sel->{name}} = $m->{vinput} if $m->{vedit};
+        $vmap{$sel->{name}} = $m->{vars}{input} if $m->{vars}{edit};
         push @lines, '';
         if (@hits) {
             push @lines, sprintf('  %s governs %d attachment%s:',
@@ -1098,7 +1100,7 @@ sub render_vars {
                 my $after = resolve_template($a->{template}, \%vmap);
                 my $row = sprintf('    %-24s %-16s pid %s',
                     $a->{template}, $a->{session}, $a->{pid});
-                $row .= "  -> $after" if $m->{vedit} && $after ne $a->{session};
+                $row .= "  -> $after" if $m->{vars}{edit} && $after ne $a->{session};
                 push @lines, clip_plain($row, $w);
             }
         } else {
@@ -1372,10 +1374,10 @@ sub event_loop {
                     my (undef, $vn, $vv) = @$action;
                     my ($ok, $err) = run_capture_stderr(
                         'shpool', @SHPOOL_FLAGS, 'var', 'set', $vn, $vv);
-                    $m->{vedit}  = 0;
-                    $m->{vinput} = '';
+                    $m->{vars}{edit}  = 0;
+                    $m->{vars}{input} = '';
                     if ($ok) {
-                        $m->{vlist} = eval { fetch_vars() } // $m->{vlist};
+                        $m->{vars}{list} = eval { fetch_vars() } // $m->{vars}{list};
                         refresh_sessions($m);
                     } else {
                         $err =~ s/^\s+|\s+$//g;
