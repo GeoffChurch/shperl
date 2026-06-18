@@ -1094,8 +1094,7 @@ sub render_vars {
         $vmap{$sel->{name}} = $m->{vars}{input} if $m->{vars}{edit};
         push @lines, '';
         if (@hits) {
-            push @lines, sprintf('  %s governs %d attachment%s:',
-                $sel->{name}, scalar @hits, @hits == 1 ? '' : 's');
+            push @lines, "  {$sel->{name}} attachments:";
             for my $a (@hits) {
                 my $after = resolve_template($a->{template}, \%vmap);
                 my $row = sprintf('    %-24s %-16s pid %s',

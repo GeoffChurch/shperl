@@ -610,7 +610,7 @@ subtest 'golden: vars view (browsing)' => sub {
    editor    = vim   (1 session)
  > workspace = myproj   (2 sessions)
 
-  workspace governs 2 attachments:
+  {workspace} attachments:
     {workspace}-edit         myproj-edit      pid 111
     {workspace}-term         myproj-term      pid 222
   j/k: select, e: set value, esc: back
