@@ -617,4 +617,19 @@ subtest 'golden: vars view (browsing)' => sub {
 GOLDEN
 };
 
+subtest 'shell-out argv guards dash-led names and values with --' => sub {
+    is_deeply([ main::attach_cmd('-sh', 0) ],
+        [ 'shpool', 'attach', '--', '-sh' ],
+        'attach inserts -- before a dash-led name');
+    is_deeply([ main::attach_cmd('-sh', 1) ],
+        [ 'shpool', 'attach', '-f', '--', '-sh' ],
+        'attach keeps -f ahead of the -- separator');
+    is_deeply([ main::kill_cmd('-sh') ],
+        [ 'shpool', 'kill', '--', '-sh' ],
+        'kill inserts -- before a dash-led name');
+    is_deeply([ main::var_set_cmd('coin', '-xmr') ],
+        [ 'shpool', 'var', 'set', '--', 'coin', '-xmr' ],
+        'var set inserts -- before the name and value');
+};
+
 done_testing();

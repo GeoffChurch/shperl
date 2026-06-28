@@ -1193,6 +1193,29 @@ sub teardown_events {
     $EVENTS_PID      = undef;
 }
 
+# shpool command argv builders. Each inserts `--` before the
+# user-controlled positionals so a session name or value that begins
+# with a dash (e.g. "-sh") isn't parsed as a flag by shpool's argument
+# parser. Session/variable names are \w+, but variable values are
+# unconstrained, so var-set needs the guard too.
+sub attach_cmd {
+    my ($name, $force) = @_;
+    my @cmd = ('shpool', @SHPOOL_FLAGS, 'attach');
+    push @cmd, '-f' if $force;
+    push @cmd, '--', $name;
+    return @cmd;
+}
+
+sub kill_cmd {
+    my ($name) = @_;
+    return ('shpool', @SHPOOL_FLAGS, 'kill', '--', $name);
+}
+
+sub var_set_cmd {
+    my ($name, $value) = @_;
+    return ('shpool', @SHPOOL_FLAGS, 'var', 'set', '--', $name, $value);
+}
+
 # Spawn `shpool attach <name>`, handing the TTY over to the child.
 # Used for both Attach and Create (a name shpool doesn't know is
 # created on the fly). Clears the rendered frame first so the user's
@@ -1211,9 +1234,7 @@ sub shell_attach {
     # freshly-attached shell starts on a clean viewport. No \e[3J —
     # preserve scrollback.
     print STDOUT "\e[2J\e[H";
-    my @cmd = ('shpool', @SHPOOL_FLAGS, 'attach');
-    push @cmd, '-f' if $force;
-    push @cmd, $name;
+    my @cmd = attach_cmd($name, $force);
     teardown_events($m);
     my $rc = system @cmd;
     ensure_events($m);
@@ -1226,7 +1247,7 @@ sub shell_attach {
 # than letting it land in the alt-screen.
 sub shell_kill {
     my $name = shift;
-    my ($rc, $err_out) = run_capture_stderr('shpool', @SHPOOL_FLAGS, 'kill', $name);
+    my ($rc, $err_out) = run_capture_stderr(kill_cmd($name));
     $err_out =~ s/^\s+|\s+$//g;
     my $msg = length $err_out ? "kill $name: $err_out" : "kill $name failed";
     return ($rc, $msg);
@@ -1371,8 +1392,7 @@ sub event_loop {
                 # resolution at once (events then keep it current).
                 if ($action->[0] eq 'var_set') {
                     my (undef, $vn, $vv) = @$action;
-                    my ($ok, $err) = run_capture_stderr(
-                        'shpool', @SHPOOL_FLAGS, 'var', 'set', $vn, $vv);
+                    my ($ok, $err) = run_capture_stderr(var_set_cmd($vn, $vv));
                     $m->{vars}{edit}  = 0;
                     $m->{vars}{input} = '';
                     if ($ok) {
