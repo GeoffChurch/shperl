@@ -9,6 +9,7 @@ use strict;
 use warnings;
 use Getopt::Long qw(GetOptions);
 use JSON::PP ();
+use Encode qw(decode_utf8);
 use POSIX ();
 use Time::HiRes qw(time);
 
@@ -176,15 +177,28 @@ sub fetch_sessions {
 sub fetch_vars {
     open my $fh, '-|', 'shpool', @SHPOOL_FLAGS, 'var', 'list'
         or die "spawning shpool var list: $!\n";
-    my @vars;
-    while (my $line = <$fh>) {
-        chomp $line;
-        next unless length $line;
-        my ($name, $value) = split /\t/, $line, 2;
-        push @vars, { name => $name, value => $value // '' };
-    }
+    my $raw = do { local $/; <$fh> };
     close $fh;
     die "`shpool var list` failed\n" if $? != 0;
+    return parse_var_list($raw // '');
+}
+
+# Parse `shpool var list` output (UTF-8 bytes, one "name<TAB>value" line
+# each) into an arrayref of { name, value } sorted by name. Values are
+# decoded to character strings so they line up with session names, which
+# JSON::PP returns decoded; comparing a byte string against a character
+# string would mis-handle a multibyte value (drop or mis-rank it).
+sub parse_var_list {
+    my $raw = shift // '';
+    my @vars;
+    for my $line (split /\n/, $raw) {
+        next unless length $line;
+        my ($name, $value) = split /\t/, $line, 2;
+        push @vars, {
+            name  => decode_utf8($name),
+            value => decode_utf8($value // ''),
+        };
+    }
     return [ sort { $a->{name} cmp $b->{name} } @vars ];
 }
 
@@ -197,6 +211,15 @@ sub template_vars {
         push @names, $1 unless $seen{$1}++;
     }
     return @names;
+}
+
+# Variables a template references that aren't in %known — the names a
+# create-time prompt has to ask for. template_vars($name) minus the
+# known keys, first-seen order preserved (so the prompt walks them in
+# the order they appear in the name).
+sub unknown_template_vars {
+    my ($name, $known) = @_;
+    return grep { !exists $known->{$_} } template_vars($name);
 }
 
 # Resolve a template against a { name => value } map: each {name}
@@ -223,6 +246,156 @@ sub attachments_for_var {
     return @hits;
 }
 
+# The { name => value } map fed to resolve_template / candidate_values.
+# Built from real (set) variables only: synthetic unset rows carry no
+# value, and slipping an `editor => ""` in here would collapse a literal
+# {editor} in a preview to empty. The single source of that map, used
+# wherever the vars view resolves a template.
+sub resolution_map {
+    return map { $_->{name} => $_->{value} } grep { !$_->{unset} } @_;
+}
+
+# Surface variables a template references but `var list` doesn't carry:
+# union the template vars across every attachment of every session, drop
+# the ones already set, and append a synthetic { name, unset => 1 } row
+# for each remainder. The result is re-sorted by name so set and unset
+# rows interleave alphabetically, matching the list view's ordering.
+#
+# Templates live only on attached sessions (attachments[]), so a var
+# referenced solely by a detached session contributes nothing — same
+# scope as attachments_for_var. A var that is both set and referenced
+# stays a single (set) row; a var referenced by several templates yields
+# one unset row.
+sub merge_unset_vars {
+    my ($var_list, $sessions) = @_;
+    my %set = map { $_->{name} => 1 } @$var_list;
+    my (%referenced);
+    for my $s (@$sessions) {
+        for my $a (@{$s->{attachments} // []}) {
+            $referenced{$_} = 1 for template_vars($a->{session_name_template} // '');
+        }
+    }
+    my @merged = @$var_list;
+    for my $name (keys %referenced) {
+        next if $set{$name};
+        push @merged, { name => $name, unset => 1 };
+    }
+    return [ sort { $a->{name} cmp $b->{name} } @merged ];
+}
+
+# Candidate values for a variable: values that, substituted for $target
+# (other variables pinned to their current values in $vars_map), make one
+# of $target's templates resolve to a session name that currently exists.
+# $vars_map is the { name => value } hash resolve_template consumes.
+#
+# Templates come only from currently-attached sessions (attachments[]),
+# but the match scans ALL session names — a detached session still exists
+# by name and is a valid re-dial target. The capture is a prefix/suffix
+# strip (length-checked substr, never index by prefix length), so it's
+# byte-safe on multibyte names. Returns the current value first, then the
+# harvested captures, de-duplicated.
+sub candidate_values {
+    my ($sessions, $vars_map, $target) = @_;
+    my $current = $vars_map->{$target} // '';
+
+    # Distinct templates (from attachments) that mention {$target}.
+    my (@templates, %tseen);
+    for my $s (@$sessions) {
+        for my $a (@{$s->{attachments} // []}) {
+            my $tmpl = $a->{session_name_template} // '';
+            next unless grep { $_ eq $target } template_vars($tmpl);
+            push @templates, $tmpl unless $tseen{$tmpl}++;
+        }
+    }
+
+    my @names = map { $_->{name} } @$sessions;
+
+    my (@cands, %seen);
+    $seen{$current} = 1;
+    push @cands, $current;
+
+    for my $tmpl (@templates) {
+        # Split into literal / {var} tokens (odd indices are var tokens),
+        # matching resolve_template's \{\w+\} rule. Locate the single
+        # {$target} token; skip the template if it appears 0 or 2+ times.
+        my @parts = split /(\{\w+\})/, $tmpl, -1;
+        my @target_at = grep { $parts[$_] eq "{$target}" } 0 .. $#parts;
+        next if @target_at != 1;
+        my $ti = $target_at[0];
+
+        # Pin co-vars: everything but the target token, resolved against
+        # $vars_map (unknown co-var stays literal {name}, per
+        # resolve_template), collapsing to prefix + {target} + suffix.
+        my $prefix = resolve_template(join('', @parts[0 .. $ti - 1]),    $vars_map);
+        my $suffix = resolve_template(join('', @parts[$ti + 1 .. $#parts]), $vars_map);
+
+        for my $n (@names) {
+            # Strip $prefix from the front and $suffix from the back; the
+            # remainder is the captured value. Length-checked so we never
+            # over-read or split a multibyte char.
+            next if length($n) < length($prefix) + length($suffix);
+            next if substr($n, 0, length $prefix) ne $prefix;
+            next if length($suffix)
+                && substr($n, -length($suffix)) ne $suffix;
+            my $cap = substr($n, length($prefix),
+                length($n) - length($prefix) - length($suffix));
+            next unless length $cap;          # empty capture dropped
+            next if $seen{$cap}++;
+            push @cands, $cap;
+        }
+    }
+    return @cands;
+}
+
+# Filter + rank candidates against a query. Keep candidates whose
+# ASCII-lowercased form has the ASCII-lowercased query as a subsequence;
+# order by a total key: (1) exact match, (2) contiguous (substring)
+# before scattered, (3) earliest first-match char index, (4) fewer
+# characters, (5) harvest index. An empty query keeps everything in
+# harvest order. All comparisons are on folded character forms, so the
+# ranking is identical regardless of byte width.
+sub filter_rank {
+    my ($cands, $query) = @_;
+    return @$cands unless length $query;
+
+    my $fold = sub { (my $s = $_[0]) =~ tr/A-Z/a-z/; $s };
+    my $fq    = $fold->($query);
+    my @fqc   = split //, $fq;
+
+    my @ranked;
+    for my $i (0 .. $#$cands) {
+        my $cand = $cands->[$i];
+        my $fc   = $fold->($cand);
+        my @fcc  = split //, $fc;
+
+        # Subsequence test on folded chars; also record the index of the
+        # first candidate char equal to the first query char.
+        my $first = -1;
+        my $qi = 0;
+        for my $ci (0 .. $#fcc) {
+            $first = $ci if $first < 0 && $fcc[$ci] eq $fqc[0];
+            $qi++ if $qi <= $#fqc && $fcc[$ci] eq $fqc[$qi];
+        }
+        next unless $qi == @fqc;              # not a subsequence
+
+        my $exact      = $fc eq $fq ? 0 : 1;
+        my $contiguous = index($fc, $fq) >= 0 ? 0 : 1;
+        push @ranked, {
+            cand  => $cand,
+            key   => [ $exact, $contiguous, $first, scalar(@fcc), $i ],
+        };
+    }
+    my @sorted = sort {
+        my ($x, $y) = ($a->{key}, $b->{key});
+        $x->[0] <=> $y->[0]
+          || $x->[1] <=> $y->[1]
+          || $x->[2] <=> $y->[2]
+          || $x->[3] <=> $y->[3]
+          || $x->[4] <=> $y->[4]
+    } @ranked;
+    return map { $_->{cand} } @sorted;
+}
+
 # Latest timestamp on the session — includes started_at so a
 # brand-new session sorts as recent even before any connect/detach.
 sub last_touched_ms {
@@ -247,19 +420,33 @@ sub model_new {
         # concurrent session creation can't quietly revalidate a stale
         # index.
         stale_select => 0,
-        mode         => 'normal',    # normal | create | kill | confirm_force | vars
+        mode         => 'normal',    # normal | create | create_vars | kill | confirm_force | vars
         mode_data    => '',          # create: partial name; kill/confirm_force: target name
+        # create_vars mode: per-var prompt state for a new session whose
+        # name references vars not yet set. Populated by event_loop when it
+        # intercepts a ['create', name] whose name has unknown vars; undef
+        # otherwise. { name, vars (ordered unknowns), idx, input,
+        # collected ([[var,val],...]), set_vars ({name=>value} of the
+        # already-set vars, for the live name preview) }.
+        var_prompt   => undef,
         error        => undef,
         parser_state => 'normal',    # normal | esc | esc_bracket
         events_pid   => undef,       # `shpool events` child pid, or undef
         events_fh    => undef,       # read end of its stdout pipe, or undef
         # vars mode (browsing/editing the daemon's template variables),
         # grouped under one key so the view's state lives together.
+        # While editing, the value selector holds a two-slot edit state:
+        # `field` is the text Enter applies; `filter` is `field` as of the
+        # last typing keystroke (frozen while arrowing) and is what the
+        # `cands` list filters by; `highlight` indexes the filtered list.
         vars         => {
-            list  => [],   # [ { name, value }, ... ] sorted by name
-            sel   => 0,    # selected index into list
-            edit  => 0,    # 1 while typing a new value
-            input => '',   # the in-progress value while editing
+            list      => [],   # [ { name, value }, ... ] sorted by name
+            sel       => 0,    # selected index into list
+            edit      => 0,    # 1 while editing a value
+            field     => '',   # editable text; the value Enter applies
+            filter    => '',   # list filter: field as of the last keystroke
+            cands     => [],   # harvested candidate values (fixed per edit)
+            highlight => 0,    # index into the filtered (shown) list
         },
     };
 }
@@ -425,6 +612,7 @@ sub process_input {
     $m->{error} = undef unless $m->{stale_select};
     return process_normal(\@keep, $m)                          if $m->{mode} eq 'normal';
     return process_create_input(\@keep, $m)                    if $m->{mode} eq 'create';
+    return process_create_vars_input(\@keep, $m)               if $m->{mode} eq 'create_vars';
     return process_yn_confirm(\@keep, $m, 'kill')              if $m->{mode} eq 'kill';
     return process_yn_confirm(\@keep, $m, 'attach_force')      if $m->{mode} eq 'confirm_force';
     return process_vars_input(\@keep, $m)                      if $m->{mode} eq 'vars';
@@ -490,18 +678,74 @@ sub enter_vars_mode {
         model_set_error($m, "shpool var list: $e");
         return;
     }
-    $m->{vars}{list}  = $vars;
+    $m->{vars}{list}  = merge_unset_vars($vars, $m->{sessions});
     $m->{vars}{sel}   = 0;
-    $m->{vars}{edit}  = 0;
-    $m->{vars}{input} = '';
+    vars_edit_clear($m);
     $m->{mode}   = 'vars';
+}
+
+# Re-derive the displayed variable list — set rows ∪ the unset rows the
+# current sessions reference — while keeping the cursor on the same
+# variable by name. The list is a function of (real vars, sessions), so
+# anything that changes either input while we're in the view (a `var
+# set`, a session refresh) runs through here. The cursor moves by name
+# because the merge re-sorts and a set can both add and remove rows
+# (promoting an unset row to a set one, shifting indices); on no match
+# (only a concurrent external `var unset` can drop the selected name)
+# clamp to the last row. Filters out any prior synthetic rows first so
+# they never feed back into the union as if they were set.
+sub remerge_vars {
+    my $m = shift;
+    my $cur = $m->{vars}{list};
+    # Guard the index read so an empty or out-of-bounds selection can't
+    # autovivify a phantom row into the array via the ->{name} deref.
+    my $prev = $m->{vars}{sel} <= $#$cur ? $cur->[$m->{vars}{sel}]{name} : undef;
+    my @real = grep { !$_->{unset} } @$cur;
+    $m->{vars}{list} = merge_unset_vars(\@real, $m->{sessions});
+    my ($idx);
+    ($idx) = grep { $m->{vars}{list}[$_]{name} eq $prev }
+        0 .. $#{$m->{vars}{list}} if defined $prev;
+    $m->{vars}{sel} = defined $idx ? $idx
+        : ($#{$m->{vars}{list}} < 0 ? 0 : $#{$m->{vars}{list}});
 }
 
 sub leave_vars_mode {
     my $m = shift;
     $m->{mode}   = 'normal';
-    $m->{vars}{edit}  = 0;
-    $m->{vars}{input} = '';
+    vars_edit_clear($m);
+}
+
+# Reset the value-selector slots to the not-editing state.
+sub vars_edit_clear {
+    my $m = shift;
+    $m->{vars}{edit}      = 0;
+    $m->{vars}{field}     = '';
+    $m->{vars}{filter}    = '';
+    $m->{vars}{cands}     = [];
+    $m->{vars}{highlight} = 0;
+}
+
+# Open the value selector on the selected variable: harvest candidates
+# from existing session names, start with an empty field/filter (the
+# current value is just the highlighted row, not prefilled text), and
+# highlight the first row.
+sub vars_edit_start {
+    my $m = shift;
+    return unless @{$m->{vars}{list}};
+    my %vmap = resolution_map(@{$m->{vars}{list}});
+    my $name = $m->{vars}{list}[$m->{vars}{sel}]{name};
+    $m->{vars}{edit}      = 1;
+    $m->{vars}{field}     = '';
+    $m->{vars}{filter}    = '';
+    $m->{vars}{cands}     = [ candidate_values($m->{sessions}, \%vmap, $name) ];
+    $m->{vars}{highlight} = 0;
+}
+
+# The visible candidate list: cands filtered/ranked by the current
+# filter. The list Up/Down navigates and that render_vars windows.
+sub vars_shown {
+    my $m = shift;
+    return filter_rank($m->{vars}{cands}, $m->{vars}{filter});
 }
 
 sub vars_select {
@@ -557,6 +801,16 @@ sub process_create_input {
                 my $name = $m->{mode_data};
                 $m->{mode}      = 'normal';
                 $m->{mode_data} = '';
+                # Dup-check in the pure handler, before any var detection:
+                # a name that already exists short-circuits to an error
+                # with no prompt and no var sets. `shpool attach` is
+                # create-or-attach, so without this a duplicate name would
+                # silently attach. (The create action-handler repeats this
+                # check post-teardown as a backstop.)
+                if (grep { $_->{name} eq $name } @{$m->{sessions}}) {
+                    model_set_error($m, "session '$name' already exists");
+                    return undef;
+                }
                 return [ 'create', $name ];
             }
         }
@@ -572,29 +826,118 @@ sub process_create_input {
     return undef;
 }
 
+# Create-time variable prompt. Walks $m->{var_prompt}{vars} (the unknown
+# vars referenced by the new session's name, in template order), one at a
+# time: printable/Backspace edit the current `input`; Enter pushes
+# (current var, input) to `collected` when non-empty (an empty entry
+# skips that var — it stays unset, surfaced later by the vars view) and
+# advances `idx`. Once every var has been visited, drop to normal mode
+# (so a failed apply's error isn't hidden behind this bottom-bar label)
+# and emit ['create_vars', name, \@collected]; event_loop sets each pair
+# then reuses the create→attach path. Esc/^C cancel the whole prompt
+# (nothing is set, no session is created).
+sub process_create_vars_input {
+    my ($tokens, $m) = @_;
+    my $vp = $m->{var_prompt};
+    for my $t (@$tokens) {
+        if ($t->[0] eq 'bare_esc') {
+            $m->{mode}        = 'normal';
+            $m->{var_prompt}  = undef;
+            return undef;
+        }
+        next if $t->[0] eq 'csi';    # arrow keys etc. — silently ignored
+        my $b = $t->[1];
+        if ($b == 0x03) {
+            $m->{mode}        = 'normal';
+            $m->{var_prompt}  = undef;
+            return undef;
+        }
+        elsif ($b == 0x0d || $b == 0x0a) {
+            push @{$vp->{collected}}, [ $vp->{vars}[$vp->{idx}], $vp->{input} ]
+                if length $vp->{input};
+            $vp->{idx}++;
+            if ($vp->{idx} == @{$vp->{vars}}) {
+                # Drop to normal before emitting so an apply failure's
+                # error (parked by event_loop) isn't outranked by this
+                # prompt's bottom-bar label.
+                my $name      = $vp->{name};
+                my $collected = $vp->{collected};
+                $m->{mode}       = 'normal';
+                $m->{var_prompt} = undef;
+                return [ 'create_vars', $name, $collected ];
+            }
+            $vp->{input} = '';
+        }
+        elsif ($b == 0x7f || $b == 0x08) {
+            $vp->{input} = substr($vp->{input}, 0, -1) if length $vp->{input};
+        }
+        elsif ($b >= 0x20 && $b <= 0x7e) {    # printable (values may hold spaces)
+            $vp->{input} .= chr($b);
+        }
+    }
+    return undef;
+}
+
 # Template-variable view. Two sub-states keyed off vars.edit:
-#   browsing — j/k move the cursor; e/Enter open the value line; Esc/q
+#   browsing — j/k move the cursor; e/Enter open the value selector; Esc/q
 #              (or ^C) return to the session list.
-#   editing  — printable bytes accumulate in vars.input; Enter commits a
+#   editing  — the value selector. Up/Down move the highlight within the
+#              candidate list (copying the highlighted value into `field`,
+#              leaving `filter` frozen so the list stays put); printable
+#              bytes / Backspace edit `field`, refresh `filter` from it,
+#              and reset the highlight to the top; Enter commits a
 #              ['var_set', name, value] action (run inline by event_loop,
-#              which re-fetches vars + sessions so the preview updates);
-#              Esc/^C abandon the edit. csi (arrows) ignored either way.
+#              which re-fetches vars + sessions so the preview updates) —
+#              applying `field`, or the highlighted candidate when `field`
+#              is empty; Esc/^C abandon the edit.
 sub process_vars_input {
     my ($tokens, $m) = @_;
     for my $t (@$tokens) {
         if ($m->{vars}{edit}) {
-            if ($t->[0] eq 'bare_esc') { $m->{vars}{edit} = 0; $m->{vars}{input} = ''; next; }
-            next if $t->[0] eq 'csi';
+            if ($t->[0] eq 'bare_esc') { vars_edit_clear($m); next; }
+            # Arrows move the highlight and copy the highlighted candidate
+            # into the field; the filter is left frozen so the list stays
+            # stable while arrowing. Handled before the byte path so CSI
+            # final bytes are never typed into the field. Other CSI
+            # sequences are consumed.
+            if ($t->[0] eq 'csi') {
+                if ($t->[1] == ord 'A' || $t->[1] == ord 'B') {
+                    my @shown = vars_shown($m);
+                    if (@shown) {
+                        my $dir = $t->[1] == ord 'B' ? 1 : -1;
+                        my $h   = $m->{vars}{highlight} + $dir;
+                        $h = 0          if $h < 0;
+                        $h = $#shown    if $h > $#shown;
+                        $m->{vars}{highlight} = $h;
+                        $m->{vars}{field}     = $shown[$h];
+                    }
+                }
+                next;
+            }
             my $b = $t->[1];
-            if ($b == 0x03) { $m->{vars}{edit} = 0; $m->{vars}{input} = ''; next; }
+            if ($b == 0x03) { vars_edit_clear($m); next; }
             elsif ($b == 0x0d || $b == 0x0a) {
-                return [ 'var_set', $m->{vars}{list}[$m->{vars}{sel}]{name}, $m->{vars}{input} ];
+                my $name  = $m->{vars}{list}[$m->{vars}{sel}]{name};
+                my @shown = vars_shown($m);
+                # Empty field => apply the highlighted row (= the current
+                # value, since an empty filter shows it first); otherwise
+                # apply the literal field (no dead zone — `xm` is applied
+                # as `xm` even while `xmr` is shown).
+                my $value = length $m->{vars}{field}
+                    ? $m->{vars}{field}
+                    : ($shown[$m->{vars}{highlight}] // '');
+                return [ 'var_set', $name, $value ];
             }
             elsif ($b == 0x7f || $b == 0x08) {
-                $m->{vars}{input} = substr($m->{vars}{input}, 0, -1) if length $m->{vars}{input};
+                $m->{vars}{field} = substr($m->{vars}{field}, 0, -1)
+                    if length $m->{vars}{field};
+                $m->{vars}{filter}    = $m->{vars}{field};
+                $m->{vars}{highlight} = 0;
             }
             elsif ($b >= 0x20 && $b <= 0x7e) {    # printable (values may hold spaces)
-                $m->{vars}{input} .= chr($b);
+                $m->{vars}{field}    .= chr($b);
+                $m->{vars}{filter}    = $m->{vars}{field};
+                $m->{vars}{highlight} = 0;
             }
             next;
         }
@@ -610,11 +953,7 @@ sub process_vars_input {
         elsif ($b == ord 'j' || $b == ord 'J') { vars_select($m,  1); }
         elsif ($b == ord 'k' || $b == ord 'K') { vars_select($m, -1); }
         elsif ($b == 0x0d || $b == 0x0a || $b == ord 'e') {
-            # Open the value line, prefilled with the current value.
-            if (@{$m->{vars}{list}}) {
-                $m->{vars}{edit}  = 1;
-                $m->{vars}{input} = $m->{vars}{list}[$m->{vars}{sel}]{value};
-            }
+            vars_edit_start($m);
         }
         # other keys ignored — stay in the view
     }
@@ -767,6 +1106,36 @@ sub create_input_label {
     return $l;
 }
 
+# Create-time variable prompt bottom bar: which var is being asked for,
+# the value typed so far, and a live preview of the session name as it
+# resolves under the values entered so far. The preview map is the
+# already-set vars, plus every value collected on prior prompts, plus the
+# current var bound to the in-progress input. Vars still to be prompted
+# are deliberately left out of the map so resolve_template renders them as
+# the literal {name} — folding them in empty would collapse a {future}-x
+# template to -x, mis-previewing the eventual name.
+sub create_vars_label {
+    my $vp = shift;
+    my $var = $vp->{vars}[$vp->{idx}];
+    my %map = %{ $vp->{set_vars} };
+    $map{$_->[0]} = $_->[1] for @{$vp->{collected}};
+    $map{$var}    = $vp->{input};
+    my $preview = resolve_template($vp->{name}, \%map);
+    my $last = $vp->{idx} == $#{$vp->{vars}};
+
+    my $l = label_new();
+    label_push_plain($l, "set value for ");
+    label_push_key($l,   $var);
+    label_push_plain($l, ': ');
+    label_push_key($l,   $vp->{input});
+    label_push_plain($l, "_   ");
+    label_push_plain($l, $preview);
+    label_push_plain($l, '   (');
+    push_hints($l, [ [ 'ret', $last ? 'create' : 'next' ], [ 'esc', 'cancel' ] ]);
+    label_push_plain($l, ')');
+    return $l;
+}
+
 sub error_label {
     my $msg = shift;
     my $l = label_new();
@@ -813,7 +1182,7 @@ sub vars_bottom_label {
         label_push_plain($l, 'set ');
         label_push_key($l,   $m->{vars}{list}[$m->{vars}{sel}]{name});
         label_push_plain($l, ' = ');
-        label_push_key($l,   $m->{vars}{input});
+        label_push_key($l,   $m->{vars}{field});
         label_push_plain($l, '_   (');
         push_hints($l, [ [ 'ret', 'apply' ], [ 'esc', 'cancel' ] ]);
         label_push_plain($l, ')');
@@ -1023,6 +1392,7 @@ sub session_row {
 sub bottom_bar_label {
     my $m = shift;
     return create_input_label($m->{mode_data})  if $m->{mode} eq 'create';
+    return create_vars_label($m->{var_prompt})  if $m->{mode} eq 'create_vars';
     return confirm_force_label($m->{mode_data}) if $m->{mode} eq 'confirm_force';
     return confirm_kill_label($m->{mode_data})  if $m->{mode} eq 'kill';
     return error_label($m->{error})             if defined $m->{error};
@@ -1065,55 +1435,134 @@ sub render_vars {
     my $out = "\e[2J\e[H";
     $out .= render_bar($w, vars_title_label($m), 'center');
 
+    my $body_rows = $h - 2;             # title bar + bottom bar
+    $body_rows = 0 if $body_rows < 0;
+
     my $vlist = $m->{vars}{list};
     my @lines;
     if (!@$vlist) {
         push @lines, '  (no variables — shpool var set NAME VALUE)';
     } else {
-        my $nw = 0;
-        for my $v (@$vlist) { my $n = length $v->{name}; $nw = $n if $n > $nw; }
-        for my $i (0 .. $#$vlist) {
-            my $v     = $vlist->[$i];
-            my $arrow = $i == $m->{vars}{sel} ? '>' : ' ';
-            my $count = scalar attachments_for_var($m->{sessions}, $v->{name});
-            my $row = clip_plain(
-                sprintf(' %s %-*s = %s   (%d session%s)',
-                    $arrow, $nw, $v->{name}, $v->{value},
-                    $count, $count == 1 ? '' : 's'),
-                $w);
-            push @lines, $i == $m->{vars}{sel}
-                ? sprintf('%s%-*s%s', $SGR_SELECTED, $w, $row, $SGR_RESET)
-                : $row;
-        }
+        push @lines, vars_list_lines($m, $w);
 
-        my $sel  = $vlist->[$m->{vars}{sel}];
-        my @hits = attachments_for_var($m->{sessions}, $sel->{name});
-        # While editing, resolve against the typed value so each row
-        # shows its prospective re-dial target.
-        my %vmap = map { $_->{name} => $_->{value} } @$vlist;
-        $vmap{$sel->{name}} = $m->{vars}{input} if $m->{vars}{edit};
-        push @lines, '';
-        if (@hits) {
-            push @lines, "  {$sel->{name}} attachments:";
-            for my $a (@hits) {
-                my $after = resolve_template($a->{template}, \%vmap);
-                my $row = sprintf('    %-24s %-16s pid %s',
-                    $a->{template}, $a->{session}, $a->{pid});
-                $row .= "  -> $after" if $m->{vars}{edit} && $after ne $a->{session};
-                push @lines, clip_plain($row, $w);
-            }
+        my $sel    = $vlist->[$m->{vars}{sel}];
+        my %vmap   = resolution_map(@$vlist);
+
+        if ($m->{vars}{edit}) {
+            # Layout C: variable list, then the windowed candidate list,
+            # then the re-dial preview pointed at the highlighted
+            # candidate (or, when nothing matches the filter, the literal
+            # field). Window the candidate list into whatever rows the
+            # variable list + preview block leave free, so the preview is
+            # never crowded out; the body still top-clips as a backstop.
+            my @shown   = vars_shown($m);
+            my $target  = @shown ? $shown[$m->{vars}{highlight}] : $m->{vars}{field};
+            my @preview = vars_preview_lines($m, $sel, \%vmap, $target, $w);
+            my $reserved = scalar(@lines)        # variable list
+                         + 1                      # candidate header
+                         + scalar(@preview);      # blank + preview block
+            my $rows = $body_rows - $reserved;
+            $rows = 3 if $rows < 3;               # small floor; clip backstops
+            push @lines, vars_cand_lines($m, \@shown, $rows, $w);
+            push @lines, @preview;
         } else {
-            push @lines, '  (no attachments reference this variable)';
+            # Browsing: resolve the preview against current values.
+            push @lines, vars_preview_lines($m, $sel, \%vmap, undef, $w);
         }
     }
 
-    my $body_rows = $h - 2;             # title bar + bottom bar
-    if    ($body_rows <= 0)        { @lines = (); }
-    elsif (@lines > $body_rows)    { @lines = @lines[0 .. $body_rows - 1]; }
+    if    ($body_rows <= 0)     { @lines = (); }
+    elsif (@lines > $body_rows) { @lines = @lines[0 .. $body_rows - 1]; }
     $out .= "$_\r\n" for @lines;
 
     $out .= render_bar($w, vars_bottom_label($m), 'left');
     return $out;
+}
+
+# The variable list: one row per variable, the selected row marked and
+# reverse-video, each annotated with how many attachments it governs. An
+# unset row — a variable a template references but `var list` doesn't
+# carry — drops the `= value` for a dimmed (unset) in the value column;
+# setting it (e/Enter) creates the variable.
+sub vars_list_lines {
+    my ($m, $w) = @_;
+    my $vlist = $m->{vars}{list};
+    my $nw = 0;
+    for my $v (@$vlist) { my $n = length $v->{name}; $nw = $n if $n > $nw; }
+    my @lines;
+    for my $i (0 .. $#$vlist) {
+        my $v     = $vlist->[$i];
+        my $sel   = $i == $m->{vars}{sel};
+        my $arrow = $sel ? '>' : ' ';
+        my $count = scalar attachments_for_var($m->{sessions}, $v->{name});
+        my $tail  = sprintf('   (%d session%s)', $count, $count == 1 ? '' : 's');
+        my $row   = $v->{unset}
+            ? sprintf(' %s %-*s   (unset)%s', $arrow, $nw, $v->{name}, $tail)
+            : sprintf(' %s %-*s = %s%s',      $arrow, $nw, $v->{name}, $v->{value}, $tail);
+        $row = clip_plain($row, $w);
+        my $line = $sel
+            ? sprintf('%s%-*s%s', $SGR_SELECTED, $w, $row, $SGR_RESET)
+            : $row;
+        # Dim the (unset) marker as a post-pad substitution so the
+        # width/clip accounting above stays on plain text. On the
+        # selected row, re-assert reverse-video after the marker's reset
+        # so the dim doesn't bleed into the rest of the row.
+        if ($v->{unset}) {
+            my $dimmed = $SGR_AMBER_DIM . '(unset)' . $SGR_RESET
+                       . ($sel ? $SGR_SELECTED : '');
+            $line =~ s/\Q(unset)\E/$dimmed/;
+        }
+        push @lines, $line;
+    }
+    return @lines;
+}
+
+# The candidate list while editing: a header plus the visible window of
+# @$shown (sized to $rows around the highlight via the shared viewport
+# helper), the highlighted row marked and reverse-video.
+sub vars_cand_lines {
+    my ($m, $shown, $rows, $w) = @_;
+    my @lines = ('  candidate values:');
+    if (!@$shown) {
+        push @lines, '    (no matching session names)';
+        return @lines;
+    }
+    $rows = 1 if $rows < 1;
+    my ($start, $end) = viewport(scalar @$shown, $m->{vars}{highlight}, $rows);
+    for my $i ($start .. $end - 1) {
+        my $arrow = $i == $m->{vars}{highlight} ? '>' : ' ';
+        my $row = clip_plain(sprintf(' %s %s', $arrow, $shown->[$i]), $w);
+        push @lines, $i == $m->{vars}{highlight}
+            ? sprintf('%s%-*s%s', $SGR_SELECTED, $w, $row, $SGR_RESET)
+            : $row;
+    }
+    return @lines;
+}
+
+# The re-dial preview: one line per attachment the selected variable
+# governs, under the "  {V} attachments:" header. With $target defined
+# (editing), each row shows "-> resolved" for the prospective value when
+# it differs from the current session. A leading blank separates the
+# block from whatever precedes it.
+sub vars_preview_lines {
+    my ($m, $sel, $vmap, $target, $w) = @_;
+    my @hits = attachments_for_var($m->{sessions}, $sel->{name});
+    my %vmap = %$vmap;
+    $vmap{$sel->{name}} = $target if defined $target;
+    my @lines = ('');
+    if (@hits) {
+        push @lines, "  {$sel->{name}} attachments:";
+        for my $a (@hits) {
+            my $after = resolve_template($a->{template}, \%vmap);
+            my $row = sprintf('    %-24s %-16s pid %s',
+                $a->{template}, $a->{session}, $a->{pid});
+            $row .= "  -> $after" if defined $target && $after ne $a->{session};
+            push @lines, clip_plain($row, $w);
+        }
+    } else {
+        push @lines, '  (no attachments reference this variable)';
+    }
+    return @lines;
 }
 
 # ---------------------------------------------------------------------------
@@ -1130,6 +1579,13 @@ sub refresh_sessions {
     }
     model_refresh($m, $new);
     cancel_modal_if_target_gone($m);
+    # In the vars view the displayed list depends on the sessions just
+    # refreshed (the unset rows are derived from their templates), so
+    # re-merge against the new list, keeping the cursor on its variable
+    # by name. This also self-corrects the post-`var set` re-dial: the
+    # refresh that follows a set lands here and merges against fresh
+    # sessions.
+    remerge_vars($m) if $m->{mode} eq 'vars';
 }
 
 # Drop kill/confirm_force modals whose target session has disappeared
@@ -1393,10 +1849,21 @@ sub event_loop {
                 if ($action->[0] eq 'var_set') {
                     my (undef, $vn, $vv) = @$action;
                     my ($ok, $err) = run_capture_stderr(var_set_cmd($vn, $vv));
-                    $m->{vars}{edit}  = 0;
-                    $m->{vars}{input} = '';
+                    vars_edit_clear($m);
                     if ($ok) {
-                        $m->{vars}{list} = eval { fetch_vars() } // $m->{vars}{list};
+                        # The set may have promoted an unset row to a set
+                        # one (or added a brand-new var); pull the fresh
+                        # set rows, point the cursor at the var we just
+                        # set, then let refresh_sessions re-merge the
+                        # unset rows against the re-dialed sessions and
+                        # carry the cursor across the resort by name.
+                        my $fresh = eval { fetch_vars() };
+                        if ($fresh) {
+                            $m->{vars}{list} = $fresh;
+                            my ($i) = grep { $fresh->[$_]{name} eq $vn }
+                                0 .. $#$fresh;
+                            $m->{vars}{sel} = $i // 0;
+                        }
                         refresh_sessions($m);
                     } else {
                         $err =~ s/^\s+|\s+$//g;
@@ -1404,6 +1871,62 @@ sub event_loop {
                             length $err ? "var set $vn: $err" : "var set $vn failed");
                     }
                     next;
+                }
+                # Detect create-time variable prompts. A new session whose
+                # name references vars not yet set drops into the per-var
+                # prompt mode instead of attaching: staying in the
+                # alt-screen here is mandatory for frame-parity — bouncing
+                # out to the create action-handler would tear down and
+                # re-enter the alt screen (flicker). With every referenced
+                # var already set, fall through to the create→attach
+                # action unchanged.
+                if ($action->[0] eq 'create') {
+                    my (undef, $name) = @$action;
+                    my $vars = eval { fetch_vars() };
+                    if ($@) {
+                        (my $e = $@) =~ s/^\s+|\s+$//g;
+                        model_set_error($m, "shpool var list: $e");
+                        next;
+                    }
+                    my %set = map { $_->{name} => $_->{value} } @$vars;
+                    my @unknown = unknown_template_vars($name, \%set);
+                    if (@unknown) {
+                        $m->{mode}       = 'create_vars';
+                        $m->{var_prompt} = {
+                            name      => $name,
+                            vars      => \@unknown,
+                            idx       => 0,
+                            input     => '',
+                            collected => [],
+                            set_vars  => \%set,
+                        };
+                        next;
+                    }
+                    return [ 'create', $name ];
+                }
+                # Apply collected variable values, then attach. Set each
+                # pair in order (last-write-wins against any concurrent
+                # daemon-side change); on a failure park the error and
+                # abort with no attach — the mode is already normal (the
+                # prompt dropped to it on the final Enter) so the error
+                # surfaces. Partial sets linger (no rollback): a later set
+                # that fails leaves the earlier ones applied, and the next
+                # create detect sees them as known.
+                if ($action->[0] eq 'create_vars') {
+                    my (undef, $name, $pairs) = @$action;
+                    my $failed = 0;
+                    for my $p (@$pairs) {
+                        my ($vn, $vv) = @$p;
+                        my ($ok, $err) = run_capture_stderr(var_set_cmd($vn, $vv));
+                        next if $ok;
+                        $err =~ s/^\s+|\s+$//g;
+                        model_set_error($m,
+                            length $err ? "var set $vn: $err" : "var set $vn failed");
+                        $failed = 1;
+                        last;
+                    }
+                    next if $failed;
+                    return [ 'create', $name ];
                 }
                 return $action;
             }
