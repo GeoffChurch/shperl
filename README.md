@@ -26,6 +26,10 @@ Press `v` to manage `shpool`'s template variables and their attached sessions.
                               variables (2)
  > coin   = djt   (1 session)
    editor = acme   (1 session)
+  candidate values:
+   djt
+ > xmr
+   xrp
 
   {coin} attachments:
     {coin}-miner             djt-miner        pid 4321  -> xmr-miner
@@ -36,7 +40,7 @@ Press `v` to manage `shpool`'s template variables and their attached sessions.
 
 1. [Install `shpool`](https://github.com/shell-pool/shpool#installation)
 2. Set your table with whatever flavor you like:
-   
+
    - *L'amuse-bouche*
 
      ```bash
