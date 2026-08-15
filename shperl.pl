@@ -143,6 +143,84 @@ sub token_to_key {
 }
 
 # ---------------------------------------------------------------------------
+# shpool shell-outs
+# ---------------------------------------------------------------------------
+# Run @cmd, returning (ok, stdout, stderr). Every shpool invocation whose
+# output shperl *reads* goes through here, so the daemon's diagnostics
+# land in $err for the caller to park in the error slot instead of
+# painting themselves over the alt screen ("could not connect to daemon"
+# across the table).
+#
+# `shpool attach` is the deliberate exception: it takes over the
+# terminal, and piping its stderr breaks shpool's own detach detection,
+# so shell_attach hands it the real tty via system() instead.
+#
+# Both pipes are drained with select rather than one after the other:
+# reading stdout to EOF first would wedge a child that filled the stderr
+# pipe buffer meanwhile, and vice versa.
+sub run_capture {
+    my @cmd = @_;
+    pipe(my $out_r, my $out_w) or die "pipe: $!";
+    pipe(my $err_r, my $err_w) or die "pipe: $!";
+    my $pid = fork;
+    die "fork: $!" unless defined $pid;
+    if ($pid == 0) {
+        close $out_r;
+        close $err_r;
+        open STDOUT, '>&', $out_w or POSIX::_exit(127);
+        open STDERR, '>&', $err_w or POSIX::_exit(127);
+        close $out_w;
+        close $err_w;
+        no warnings 'exec';
+        exec { $cmd[0] } @cmd;
+        POSIX::_exit(127);
+    }
+    close $out_w;
+    close $err_w;
+
+    my ($out, $err) = ('', '');
+    my %live = (
+        fileno($out_r) => [ $out_r, \$out ],
+        fileno($err_r) => [ $err_r, \$err ],
+    );
+    while (%live) {
+        my $rin = '';
+        vec($rin, $_, 1) = 1 for keys %live;
+        # select(2) writes the result mask into the input arg, so copy.
+        my $rout   = $rin;
+        my $nfound = select($rout, undef, undef, undef);
+        if ($nfound < 0) {
+            next if $!{EINTR};    # SIGWINCH while the action runs
+            die "select: $!";
+        }
+        for my $fno (keys %live) {
+            next unless vec($rout, $fno, 1);
+            my ($fh, $dest) = @{ $live{$fno} };
+            my $got = sysread($fh, my $chunk, 65536);
+            if (!defined $got) { delete $live{$fno} unless $!{EINTR} }
+            elsif ($got == 0)  { delete $live{$fno} }
+            else               { $$dest .= $chunk }
+        }
+    }
+    close $out_r;
+    close $err_r;
+    waitpid $pid, 0;
+    return ($? == 0, $out, $err);
+}
+
+# Collapse a shell-out's stderr into one line for the error slot. The
+# daemon's own complaint ("could not connect to daemon", "no session
+# named 'foo'") beats a generic failure wherever it said anything;
+# returns '' when it said nothing, so callers can fall back.
+sub tidy_stderr {
+    my $err = shift // '';
+    $err =~ s/\s+/ /g;
+    $err =~ s/^ //;
+    $err =~ s/ $//;
+    return $err;
+}
+
+# ---------------------------------------------------------------------------
 # Session fetch + model
 # ---------------------------------------------------------------------------
 # Optional @extra args go between the global flags and the subcommand —
@@ -151,12 +229,12 @@ sub token_to_key {
 # is.
 sub fetch_sessions {
     my @extra = @_;
-    open my $fh, '-|', 'shpool', @SHPOOL_FLAGS, @extra, 'list', '--json'
-        or die "spawning shpool list --json: $!\n";
-    my $json = do { local $/; <$fh> };
-    close $fh;
-    if ($? != 0) {
-        die "`shpool list --json` failed\n";
+    my ($ok, $json, $err) =
+        run_capture('shpool', @SHPOOL_FLAGS, @extra, 'list', '--json');
+    unless ($ok) {
+        # The caller prefixes "shpool list: ", so die with the detail only.
+        my $detail = tidy_stderr($err);
+        die length $detail ? "$detail\n" : "`shpool list --json` failed\n";
     }
     my $reply = eval { JSON::PP::decode_json($json) };
     die "parsing shpool list JSON: $@" if $@;
@@ -175,11 +253,12 @@ sub fetch_sessions {
 # "name<TAB>value" line each). Returns an arrayref of { name, value }
 # sorted by name. Dies on spawn/exit failure like fetch_sessions.
 sub fetch_vars {
-    open my $fh, '-|', 'shpool', @SHPOOL_FLAGS, 'var', 'list'
-        or die "spawning shpool var list: $!\n";
-    my $raw = do { local $/; <$fh> };
-    close $fh;
-    die "`shpool var list` failed\n" if $? != 0;
+    my ($ok, $raw, $err) = run_capture('shpool', @SHPOOL_FLAGS, 'var', 'list');
+    unless ($ok) {
+        # As in fetch_sessions: callers supply the "shpool var list: " prefix.
+        my $detail = tidy_stderr($err);
+        die length $detail ? "$detail\n" : "`shpool var list` failed\n";
+    }
     return parse_var_list($raw // '');
 }
 
@@ -1712,9 +1791,9 @@ sub shell_attach {
 # than letting it land in the alt-screen.
 sub shell_kill {
     my $name = shift;
-    my ($rc, $err_out) = run_capture_stderr(kill_cmd($name));
-    $err_out =~ s/^\s+|\s+$//g;
-    my $msg = length $err_out ? "kill $name: $err_out" : "kill $name failed";
+    my ($rc, undef, $err) = run_capture(kill_cmd($name));
+    my $detail = tidy_stderr($err);
+    my $msg = length $detail ? "kill $name: $detail" : "kill $name failed";
     return ($rc, $msg);
 }
 
@@ -1737,29 +1816,6 @@ sub finish_action {
         }
     }
     model_set_error($m, $err_msg) if !$ok;
-}
-
-# Capture stderr of a child process via a pipe. Returns ($ok, $stderr)
-# where $ok is true iff the child exited with status 0.
-sub run_capture_stderr {
-    my @cmd = @_;
-    pipe(my $r, my $w) or die "pipe: $!";
-    my $pid = fork;
-    die "fork: $!" unless defined $pid;
-    if ($pid == 0) {
-        close $r;
-        open STDERR, '>&', $w or POSIX::_exit(127);
-        open STDOUT, '>', '/dev/null';
-        close $w;
-        no warnings 'exec';
-        exec { $cmd[0] } @cmd;
-        POSIX::_exit(127);
-    }
-    close $w;
-    my $err = do { local $/; <$r> };
-    close $r;
-    waitpid $pid, 0;
-    return ($? == 0, $err // '');
 }
 
 sub event_loop {
@@ -1857,7 +1913,7 @@ sub event_loop {
                 # resolution at once (events then keep it current).
                 if ($action->[0] eq 'var_set') {
                     my (undef, $vn, $vv) = @$action;
-                    my ($ok, $err) = run_capture_stderr(var_set_cmd($vn, $vv));
+                    my ($ok, undef, $err) = run_capture(var_set_cmd($vn, $vv));
                     vars_edit_clear($m);
                     if ($ok) {
                         # The set may have promoted an unset row to a set
@@ -1926,11 +1982,11 @@ sub event_loop {
                     my $failed = 0;
                     for my $p (@$pairs) {
                         my ($vn, $vv) = @$p;
-                        my ($ok, $err) = run_capture_stderr(var_set_cmd($vn, $vv));
+                        my ($ok, undef, $err) = run_capture(var_set_cmd($vn, $vv));
                         next if $ok;
-                        $err =~ s/^\s+|\s+$//g;
+                        my $detail = tidy_stderr($err);
                         model_set_error($m,
-                            length $err ? "var set $vn: $err" : "var set $vn failed");
+                            length $detail ? "var set $vn: $detail" : "var set $vn failed");
                         $failed = 1;
                         last;
                     }

@@ -1694,4 +1694,54 @@ subtest 'refresh_sessions reports success and failure' => sub {
     is(scalar @{$m->{sessions}}, 1, 'the previous list is left in place on failure');
 };
 
+# ---------------------------------------------------------------------------
+# run_capture / tidy_stderr: the shared shell-out plumbing
+# ---------------------------------------------------------------------------
+
+subtest 'tidy_stderr collapses a complaint to one line' => sub {
+    is(main::tidy_stderr("could not connect to daemon\n"),
+        'could not connect to daemon', 'trailing newline stripped');
+    is(main::tidy_stderr("  no session named 'foo'  "),
+        "no session named 'foo'", 'surrounding space stripped');
+    is(main::tidy_stderr("first line\nsecond line\n"),
+        'first line second line', 'newlines collapse -- the error slot is one line');
+    is(main::tidy_stderr(''),      '', 'empty stays empty so callers can fall back');
+    is(main::tidy_stderr("\n\n"),  '', 'whitespace-only counts as nothing said');
+    is(main::tidy_stderr(undef),   '', 'undef is tolerated');
+};
+
+subtest 'run_capture separates the two streams and reports exit status' => sub {
+    my ($ok, $out, $err) =
+        main::run_capture($^X, '-e', 'print STDOUT "to-out"; print STDERR "to-err"');
+    ok($ok, 'exit 0 reported as ok');
+    is($out, 'to-out', 'stdout captured');
+    is($err, 'to-err', 'stderr captured separately');
+
+    my ($ok2, undef, $err2) =
+        main::run_capture($^X, '-e', 'print STDERR "boom"; exit 3');
+    ok(!$ok2, 'nonzero exit reported as failure');
+    is($err2, 'boom', 'stderr still captured on failure');
+};
+
+subtest 'run_capture drains both streams without deadlocking' => sub {
+    # A child writing more than a pipe buffer to stdout *and* to stderr
+    # wedges any implementation that reads one stream to EOF before
+    # starting on the other -- each side blocks waiting for the other.
+    my $big = 300_000;
+    my ($ok, $out, $err);
+    my $died = '';
+    eval {
+        local $SIG{ALRM} = sub { die "timed out -- deadlocked\n" };
+        alarm 30;
+        ($ok, $out, $err) = main::run_capture($^X, '-e',
+            "print STDOUT 'x' x $big; print STDERR 'y' x $big");
+        alarm 0;
+        1;
+    } or $died = $@;
+    is($died, '', 'completed rather than deadlocking');
+    ok($ok, 'child exited cleanly');
+    is(length($out // ''), $big, 'all of stdout captured');
+    is(length($err // ''), $big, 'all of stderr captured');
+};
+
 done_testing();
