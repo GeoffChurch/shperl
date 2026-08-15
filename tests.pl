@@ -1528,4 +1528,133 @@ subtest 'mid-prompt refresh_sessions leaves the create_vars prompt intact' => su
     is($m->{var_prompt}{idx}, 0, 'prompt position unchanged');
 };
 
+# ---------------------------------------------------------------------------
+# parse_args: the optional SESSION positional
+# ---------------------------------------------------------------------------
+
+# parse_args reads the global @ARGV and dies on a usage error; each case
+# localizes @ARGV and traps the die.
+sub parse_argv {
+    my @argv = @_;
+    local @ARGV = @argv;
+    my $session = eval { main::parse_args() };
+    return ($session, $@);
+}
+
+subtest 'parse_args: no positional means no startup target' => sub {
+    my ($session, $err) = parse_argv();
+    is($err,     '',    'no error');
+    is($session, undef, 'session is undef');
+};
+
+subtest 'parse_args: a single positional is the session name' => sub {
+    my ($session, $err) = parse_argv('work');
+    is($err,     '',     'no error');
+    is($session, 'work', 'session name returned');
+};
+
+subtest 'parse_args: flags and a positional coexist' => sub {
+    # Getopt::Long permutes by default, so the positional may sit either
+    # side of the flags.
+    my ($before, $e1) = parse_argv('--socket', '/tmp/s', 'work');
+    is($e1,     '',     'no error with the name last');
+    is($before, 'work', 'name found after flags');
+
+    my ($after, $e2) = parse_argv('work', '--socket', '/tmp/s');
+    is($e2,    '',     'no error with the name first');
+    is($after, 'work', 'name found before flags');
+};
+
+subtest 'parse_args: a second positional is a usage error' => sub {
+    my ($session, $err) = parse_argv('work', 'extra');
+    like($err, qr/unexpected argument/, 'dies with a usage error');
+    unlike($err, qr/\bwork\b/, 'the accepted name is not blamed, only the extras');
+    like($err, qr/\bextra\b/, 'the offending argument is named');
+};
+
+subtest 'parse_args: an empty session name is rejected' => sub {
+    # `shp host ""` would otherwise reach shpool as an empty name.
+    my ($session, $err) = parse_argv('');
+    like($err, qr/empty session name/, 'dies rather than attaching to ""');
+};
+
+# ---------------------------------------------------------------------------
+# `shperl SESSION` startup attach — run_tui dispatches this through the
+# ordinary attach action, so these assert the action's decisions given a
+# startup name. shell_attach is stubbed out (it would shell out to
+# `shpool attach` and hand it the tty).
+# ---------------------------------------------------------------------------
+
+# Dispatch a startup name exactly as run_tui does, against a stubbed
+# session list. Returns the model plus the shell_attach calls recorded.
+sub startup_attach {
+    my ($name, @sessions) = @_;
+    my $m = main::model_new();
+    my @attached;
+    no warnings qw(redefine once);
+    local *main::fetch_sessions = sub { [ @sessions ] };
+    local *main::shell_attach   = sub {
+        my (undef, $n, $force) = @_;
+        push @attached, { name => $n, force => $force ? 1 : 0 };
+        return 1;
+    };
+    $main::ACTION_HANDLER{attach}->($m, $name);
+    return ($m, \@attached);
+}
+
+# session_record() builds a Disconnected row; fetch_sessions normally
+# derives `attached` from the status string at the JSON boundary, so a
+# stubbed list has to set it itself.
+sub attached_record {
+    my ($name, $ts) = @_;
+    my $s = session_record($name, $ts);
+    $s->{status}   = 'Attached';
+    $s->{attached} = 1;
+    return $s;
+}
+
+subtest 'shperl SESSION attaches when the session exists and is free' => sub {
+    my ($m, $calls) = startup_attach('foo', session_record('foo', 100));
+    is(scalar @$calls, 1,       'attached once');
+    is($calls->[0]{name},  'foo', 'attached to the named session');
+    is($calls->[0]{force}, 0,     'without force');
+    is($m->{mode}, 'normal', 'lands in the table, not a modal');
+    is($m->{error}, undef,   'no error parked');
+};
+
+subtest 'shperl SESSION on an attached session prompts before stealing' => sub {
+    # Equivalent to pressing Enter on a row marked attached: the
+    # confirm_force modal, never a silent -f steal.
+    my ($m, $calls) = startup_attach('foo', attached_record('foo', 100));
+    is(scalar @$calls, 0, 'nothing attached yet');
+    is($m->{mode},      'confirm_force', 'promoted to the force-confirm modal');
+    is($m->{mode_data}, 'foo',           'modal targets the named session');
+};
+
+subtest 'shperl SESSION with an unknown name parks an error and shows the table' => sub {
+    # Strict equivalence with the table: you cannot Enter-attach a row
+    # that is not there, so an unknown name does not silently create.
+    my ($m, $calls) = startup_attach('nope', session_record('foo', 100));
+    is(scalar @$calls, 0, 'nothing attached');
+    like($m->{error}, qr/nope/, 'error names the missing session');
+    is($m->{mode}, 'normal', 'drops into the table');
+};
+
+subtest 'shperl SESSION does not attach when the session list fails' => sub {
+    # Deliberately not asserting *which* error survives. refresh_sessions
+    # parks "shpool list: daemon down" and returns without populating the
+    # list, then session_or_error overwrites it with "session 'foo' is
+    # gone" -- a pre-existing clobber on the shared attach path (the same
+    # thing happens pressing Enter), so pinning the message here would
+    # freeze a wart this change didn't introduce.
+    my $m = main::model_new();
+    my @attached;
+    no warnings qw(redefine once);
+    local *main::fetch_sessions = sub { die "daemon down\n" };
+    local *main::shell_attach   = sub { push @attached, $_[1]; 1 };
+    $main::ACTION_HANDLER{attach}->($m, 'foo');
+    is(scalar @attached, 0, 'nothing attached');
+    ok(defined $m->{error}, 'an error is parked rather than a silent no-op');
+};
+
 done_testing();

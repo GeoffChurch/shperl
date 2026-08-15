@@ -58,10 +58,12 @@ Press `v` to manage `shpool`'s template variables and their attached sessions.
 ## Usage
 
 ```
-shperl [--config-file PATH] [--log-file PATH] [--socket PATH] [-v ...]
+shperl [--config-file PATH] [--log-file PATH] [--socket PATH] [-v ...] [SESSION]
 ```
 
 These flags are forwarded verbatim to every `shpool` invocation, so e.g. `shperl --socket /tmp/s2` manages sessions on a non-default daemon.
+
+Given a `SESSION` name, `shperl` attaches to it straight away, skipping the table. This is exactly equivalent to starting `shperl` and pressing enter on that session's row — so detaching drops you into the table (rather than exiting), and a session that's attached elsewhere still asks before stealing it. A name that doesn't exist is an error, not an implicit create: use `n` for that, which is also what prompts for any template variables the name references.
 
 Keys:
 

@@ -1962,7 +1962,11 @@ sub session_or_error {
     return undef;
 }
 
-my %ACTION_HANDLER = (
+# Package-scoped (not `my`) so tests.pl can dispatch actions through the
+# real table, the same way run_tui does. The rest of the dispatch tables
+# stay lexical -- they're reachable through named subs like
+# process_normal; this one is only ever reached from run_tui.
+our %ACTION_HANDLER = (
     attach => sub {
         my ($m, $name) = @_;
         # Pre-flight: refresh and verify the session still exists and
@@ -2017,10 +2021,25 @@ my %ACTION_HANDLER = (
     },
 );
 
+# $session, when given, is the `shperl SESSION` startup target. It is
+# dispatched through the ordinary 'attach' action handler before the
+# first render, which makes `shperl foo` exactly equivalent to starting
+# shperl and pressing Enter on foo's row -- same pre-flight refresh,
+# same confirm_force promotion when foo is attached elsewhere, same
+# error parked in the table when it doesn't exist. Deliberately not a
+# separate attach path: there is one definition of "attach to a
+# session" and this inherits changes to it.
+#
+# It runs here rather than in main() because the handler communicates
+# by mutating $m->{mode} (confirm_force) or $m->{error}, and only the
+# loop below renders those. Cooked-mode tty is what the handler wants
+# anyway -- the loop runs handlers with raw/alt torn down too.
 sub run_tui {
-    my $m = shift;
+    my ($m, $session) = @_;
     # Sets the recompute flag and interrupts select on resize.
     $SIG{WINCH} = sub { $WINCH_PENDING = 1 };
+
+    $ACTION_HANDLER{attach}->($m, $session) if defined $session;
 
     while (1) {
         tty_enter_raw();
@@ -2042,8 +2061,11 @@ sub run_tui {
 
 # Parse top-level flags from @ARGV into @SHPOOL_FLAGS. Mirrors the
 # four global flags shpool itself accepts; everything is forwarded
-# verbatim to every shpool shell-out. Unknown flags or stray positional
-# args are a usage error.
+# verbatim to every shpool shell-out. Unknown flags or more than one
+# positional arg are a usage error.
+#
+# Returns the optional SESSION positional (undef when absent), which
+# main() hands to run_tui as a startup attach target.
 sub parse_args {
     my ($config_file, $log_file, $socket);
     my $verbose = 0;
@@ -2052,19 +2074,24 @@ sub parse_args {
         'log-file=s'    => \$log_file,
         'socket=s'      => \$socket,
         'verbose|v+'    => \$verbose,
-    ) or die "Usage: shperl [--config-file PATH] [--log-file PATH] [--socket PATH] [-v ...]\n";
-    @ARGV == 0
-        or die "shperl: unexpected argument(s): @ARGV\n";
+    ) or die "Usage: shperl [--config-file PATH] [--log-file PATH] [--socket PATH] [-v ...] [SESSION]\n";
+    @ARGV <= 1
+        or die "shperl: unexpected argument(s): @ARGV[1 .. $#ARGV]\n";
+    my ($session) = @ARGV;
+    !defined $session || length $session
+        or die "shperl: empty session name\n";
 
     @SHPOOL_FLAGS = ();
     push @SHPOOL_FLAGS, '--config-file', $config_file if defined $config_file;
     push @SHPOOL_FLAGS, '--log-file',    $log_file    if defined $log_file;
     push @SHPOOL_FLAGS, ('-v') x $verbose;
     push @SHPOOL_FLAGS, '--socket',      $socket      if defined $socket;
+
+    return $session;
 }
 
 sub main {
-    parse_args();
+    my $session = parse_args();
     if (my $inside = $ENV{SHPOOL_SESSION_NAME}) {
         print STDERR <<"EOM";
 shperl: inside shpool session "$inside" — won't run here. Nested sessions
@@ -2093,7 +2120,7 @@ EOM
     eval {
         ensure_events($m);
         refresh_sessions($m);
-        run_tui($m);
+        run_tui($m, $session);
     };
     my $err = $@;
     teardown_events($m);
