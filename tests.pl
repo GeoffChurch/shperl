@@ -1640,21 +1640,58 @@ subtest 'shperl SESSION with an unknown name parks an error and shows the table'
     is($m->{mode}, 'normal', 'drops into the table');
 };
 
-subtest 'shperl SESSION does not attach when the session list fails' => sub {
-    # Deliberately not asserting *which* error survives. refresh_sessions
-    # parks "shpool list: daemon down" and returns without populating the
-    # list, then session_or_error overwrites it with "session 'foo' is
-    # gone" -- a pre-existing clobber on the shared attach path (the same
-    # thing happens pressing Enter), so pinning the message here would
-    # freeze a wart this change didn't introduce.
+# ---------------------------------------------------------------------------
+# A failed `shpool list` must survive as the reported error. The action
+# handlers bail on a false refresh_sessions rather than going on to
+# search a list that was never updated -- at startup it is empty, so
+# searching it would report a dead daemon as a missing session.
+# ---------------------------------------------------------------------------
+
+# Dispatch an action against a daemon whose list call always fails,
+# recording any shell-out that slipped through.
+sub action_with_dead_daemon {
+    my ($action, @args) = @_;
     my $m = main::model_new();
-    my @attached;
+    my @ran;
     no warnings qw(redefine once);
     local *main::fetch_sessions = sub { die "daemon down\n" };
-    local *main::shell_attach   = sub { push @attached, $_[1]; 1 };
-    $main::ACTION_HANDLER{attach}->($m, 'foo');
-    is(scalar @attached, 0, 'nothing attached');
-    ok(defined $m->{error}, 'an error is parked rather than a silent no-op');
+    local *main::shell_attach   = sub { push @ran, "attach:$_[1]"; 1 };
+    local *main::shell_kill     = sub { push @ran, "kill:$_[0]"; (1, '') };
+    $main::ACTION_HANDLER{$action}->($m, @args);
+    return ($m, \@ran);
+}
+
+subtest 'a failed session list is reported as such, not as a missing session' => sub {
+    my ($m, $ran) = action_with_dead_daemon('attach', 'foo');
+    is(scalar @$ran, 0, 'nothing attached');
+    like($m->{error}, qr/shpool list/,  'the list failure is what gets reported');
+    like($m->{error}, qr/daemon down/,  'the underlying cause is carried through');
+    unlike($m->{error}, qr/is gone/,    'not misreported as a missing session');
+};
+
+subtest 'every list-interpreting action bails on a failed refresh' => sub {
+    # attach_force/create/kill search or dup-check the same list, so each
+    # would draw a wrong conclusion from a stale one.
+    for my $case (['attach_force', 'foo'], ['create', 'foo'], ['kill', 'foo']) {
+        my ($action, $name) = @$case;
+        my ($m, $ran) = action_with_dead_daemon($action, $name);
+        is(scalar @$ran, 0, "$action: no shell-out on a failed refresh");
+        like($m->{error}, qr/shpool list/, "$action: reports the list failure");
+    }
+};
+
+subtest 'refresh_sessions reports success and failure' => sub {
+    no warnings qw(redefine once);
+    my $m = main::model_new();
+    {
+        local *main::fetch_sessions = sub { [ session_record('foo', 100) ] };
+        ok(main::refresh_sessions($m), 'true when the list is now current');
+    }
+    {
+        local *main::fetch_sessions = sub { die "daemon down\n" };
+        ok(!main::refresh_sessions($m), 'false when the list call failed');
+    }
+    is(scalar @{$m->{sessions}}, 1, 'the previous list is left in place on failure');
 };
 
 done_testing();

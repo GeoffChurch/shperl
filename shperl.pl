@@ -1568,6 +1568,14 @@ sub vars_preview_lines {
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+# Returns true when $m->{sessions} now reflects the daemon, false when
+# the list call failed and the old contents were left in place. Callers
+# that go on to *interpret* the list (the action handlers) must bail on
+# false: on a failed refresh the list is stale, and at startup it is
+# empty, so searching it yields "session 'x' is gone" -- which would
+# then overwrite the "shpool list: ..." error parked here and report a
+# dead daemon as a missing session. Callers that only refresh-and-render
+# can ignore the result; the parked error is what they wanted anyway.
 sub refresh_sessions {
     my ($m, @extra) = @_;
     my $new = eval { fetch_sessions(@extra) };
@@ -1575,7 +1583,7 @@ sub refresh_sessions {
         my $err = $@;
         chomp $err;
         model_set_error($m, "shpool list: $err");
-        return;
+        return 0;
     }
     model_refresh($m, $new);
     cancel_modal_if_target_gone($m);
@@ -1586,6 +1594,7 @@ sub refresh_sessions {
     # refresh that follows a set lands here and merges against fresh
     # sessions.
     remerge_vars($m) if $m->{mode} eq 'vars';
+    return 1;
 }
 
 # Drop kill/confirm_force modals whose target session has disappeared
@@ -1976,7 +1985,7 @@ our %ACTION_HANDLER = (
         # the attached flag here instead. A race into Attached since
         # the keystroke promotes to confirm_force rather than
         # silently no-opping.
-        refresh_sessions($m);
+        refresh_sessions($m) or return;
         my $sess = session_or_error($m, $name) or return;
         if ($sess->{attached}) {
             $m->{mode}      = 'confirm_force';
@@ -1988,7 +1997,7 @@ our %ACTION_HANDLER = (
     },
     attach_force => sub {
         my ($m, $name) = @_;
-        refresh_sessions($m);
+        refresh_sessions($m) or return;
         session_or_error($m, $name) or return;
         my $rc = shell_attach($m, $name, 1);
         finish_action($m, $name, $rc, "shpool attach -f $name failed");
@@ -2000,7 +2009,7 @@ our %ACTION_HANDLER = (
         # silently attaches (or flashes "already has a terminal
         # attached" on stderr and no-ops) — neither is what the
         # create prompt implies.
-        refresh_sessions($m);
+        refresh_sessions($m) or return;
         if (grep { $_->{name} eq $name } @{$m->{sessions}}) {
             model_set_error($m, "session '$name' already exists");
             return;
@@ -2010,7 +2019,7 @@ our %ACTION_HANDLER = (
     },
     kill => sub {
         my ($m, $name) = @_;
-        refresh_sessions($m);
+        refresh_sessions($m) or return;
         session_or_error($m, $name) or return;
         # Move the cursor off the target before the kill so the
         # post-kill refresh doesn't raise stale_select on a session
