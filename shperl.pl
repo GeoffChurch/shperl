@@ -7,9 +7,10 @@
 
 use strict;
 use warnings;
+use utf8;    # string literals hold characters, like everything else in here
 use Getopt::Long qw(GetOptions);
 use JSON::PP ();
-use Encode qw(decode_utf8);
+use Encode qw(decode_utf8 encode_utf8);
 use POSIX ();
 use Time::HiRes qw(time);
 
@@ -158,6 +159,11 @@ sub token_to_key {
 # Both pipes are drained with select rather than one after the other:
 # reading stdout to EOF first would wedge a child that filled the stderr
 # pipe buffer meanwhile, and vice versa.
+#
+# Both streams come back decoded from UTF-8, so this is the one place
+# shpool's output turns into character strings. Leniently: it is only
+# ever parsed, compared or displayed, and a stray byte shouldn't cost
+# the diagnostic around it.
 sub run_capture {
     my @cmd = @_;
     pipe(my $out_r, my $out_w) or die "pipe: $!";
@@ -172,7 +178,7 @@ sub run_capture {
         close $out_w;
         close $err_w;
         no warnings 'exec';
-        exec { $cmd[0] } @cmd;
+        exec { $cmd[0] } encode_argv(@cmd);
         POSIX::_exit(127);
     }
     close $out_w;
@@ -205,8 +211,14 @@ sub run_capture {
     close $out_r;
     close $err_r;
     waitpid $pid, 0;
-    return ($? == 0, $out, $err);
+    return ($? == 0, decode_utf8($out), decode_utf8($err));
 }
+
+# exec and system hand each argument's internal buffer to the OS as is,
+# so without this the bytes shpool sees would depend on how perl
+# happened to store a string ("caf\x{e9}" can be stored as Latin-1).
+# Every spawn goes through here.
+sub encode_argv { return map { encode_utf8($_) } @_ }
 
 # Collapse a shell-out's stderr into one line for the error slot. The
 # daemon's own complaint ("could not connect to daemon", "no session
@@ -236,7 +248,7 @@ sub fetch_sessions {
         my $detail = tidy_stderr($err);
         die length $detail ? "$detail\n" : "`shpool list --json` failed\n";
     }
-    my $reply = eval { JSON::PP::decode_json($json) };
+    my $reply = eval { JSON::PP->new->decode($json) };
     die "parsing shpool list JSON: $@" if $@;
     my $sessions = $reply->{sessions} // [];
     # Normalize the status string to a boolean at the boundary — we
@@ -262,21 +274,16 @@ sub fetch_vars {
     return parse_var_list($raw // '');
 }
 
-# Parse `shpool var list` output (UTF-8 bytes, one "name<TAB>value" line
-# each) into an arrayref of { name, value } sorted by name. Values are
-# decoded to character strings so they line up with session names, which
-# JSON::PP returns decoded; comparing a byte string against a character
-# string would mis-handle a multibyte value (drop or mis-rank it).
+# Parse `shpool var list` output (one "name<TAB>value" line each, already
+# decoded by run_capture) into an arrayref of { name, value } sorted by
+# name.
 sub parse_var_list {
     my $raw = shift // '';
     my @vars;
     for my $line (split /\n/, $raw) {
         next unless length $line;
         my ($name, $value) = split /\t/, $line, 2;
-        push @vars, {
-            name  => decode_utf8($name),
-            value => decode_utf8($value // ''),
-        };
+        push @vars, { name => $name, value => $value // '' };
     }
     return [ sort { $a->{name} cmp $b->{name} } @vars ];
 }
@@ -1711,7 +1718,7 @@ sub spawn_events {
     if ($pid == 0) {
         open STDERR, '>', '/dev/null';
         no warnings 'exec';
-        exec { 'shpool' } 'shpool', @SHPOOL_FLAGS, 'events';
+        exec { 'shpool' } encode_argv('shpool', @SHPOOL_FLAGS, 'events');
         POSIX::_exit(127);
     }
     return ($pid, $fh);
@@ -1788,7 +1795,7 @@ sub shell_attach {
     # detached, so the title the session left behind doesn't leak
     # past it.
     print STDOUT "\e[2J\e[H\e[22;0t\e]0;$name\a";
-    my @cmd = attach_cmd($name, $force);
+    my @cmd = encode_argv(attach_cmd($name, $force));
     teardown_events($m);
     my $rc = system @cmd;
     print STDOUT "\e[23;0t";
@@ -2143,6 +2150,15 @@ sub run_tui {
 # Returns the optional SESSION positional (undef when absent), which
 # main() hands to run_tui as a startup attach target.
 sub parse_args {
+    # Arguments arrive as bytes. Decode them like everything else read
+    # from outside, so `shperl café` names the same session as "café" in
+    # shpool's decoded list. Strictly: a path that isn't UTF-8 would
+    # otherwise be rewritten on its way back out to shpool.
+    @ARGV = map {
+        my $arg = $_;
+        eval { Encode::decode('UTF-8', $arg, Encode::FB_CROAK) }
+            // die "shperl: arguments must be valid UTF-8\n";
+    } @ARGV;
     my ($config_file, $log_file, $socket);
     my $verbose = 0;
     GetOptions(
@@ -2167,8 +2183,13 @@ sub parse_args {
 }
 
 sub main {
+    # Everything inside shperl is a character string; these encode it on
+    # the way to the terminal.
+    binmode STDOUT, ':encoding(UTF-8)';
+    binmode STDERR, ':encoding(UTF-8)';
     my $session = parse_args();
     if (my $inside = $ENV{SHPOOL_SESSION_NAME}) {
+        $inside = decode_utf8($inside);
         print STDERR <<"EOM";
 shperl: inside shpool session "$inside" — won't run here. Nested sessions
         get messy (outer attach gets bumped on force, sessions created
@@ -2176,7 +2197,7 @@ shperl: inside shpool session "$inside" — won't run here. Nested sessions
         first to manage sessions. Current list:
 
 EOM
-        exec { 'shpool' } 'shpool', @SHPOOL_FLAGS, 'list';
+        exec { 'shpool' } encode_argv('shpool', @SHPOOL_FLAGS, 'list');
         die "exec shpool list: $!\n";
     }
     my $m = model_new();

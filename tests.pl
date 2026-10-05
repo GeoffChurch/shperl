@@ -669,25 +669,21 @@ subtest 'candidate_values: a template with {V} twice is skipped' => sub {
         '{v}-{v} skipped; {v}-y still captures x');
 };
 
-subtest 'parse_var_list decodes UTF-8 var-list output to characters' => sub {
-    # The var-list pipe yields raw UTF-8 bytes ("é" is the two bytes
-    # \xC3\xA9). parse_var_list must decode so values are character
-    # strings, like the JSON-decoded session names they compare against.
-    my $vars = main::parse_var_list("editor\tcaf\xC3\xA9\nworkspace\tmyproj\n");
-    is(scalar @$vars, 2, 'two variables parsed, sorted by name');
-    is($vars->[0]{name}, 'editor', 'first name');
-    is(length $vars->[0]{value}, 4, 'value is 4 characters, not 5 bytes');
-    is($vars->[0]{value}, "caf\x{E9}", 'value decoded to café');
+subtest 'parse_var_list splits name<TAB>value lines, sorted by name' => sub {
+    my $vars = main::parse_var_list("workspace\tmyproj\neditor\tcaf\x{E9}\n");
+    is(scalar @$vars, 2, 'two variables parsed');
+    is($vars->[0]{name},  'editor',      'sorted by name');
+    is($vars->[0]{value}, "caf\x{E9}",   'value kept whole');
+    is($vars->[1]{value}, 'myproj',      'second value');
 };
 
 subtest 'candidate_values: a multibyte co-var value (decoded) strips correctly' => sub {
     use utf8;
-    # The byte/char hazard end to end: the co-var "editor" arrives from
-    # var list as UTF-8 bytes and is decoded by parse_var_list; the names
-    # are characters (as from decode_json). The "café-" prefix must strip
-    # off both names by character, not byte.
+    # The co-var "editor" and the session names are both characters
+    # (run_capture decodes all shpool output). The "café-" prefix must
+    # strip off both names by character, not byte.
     my %map = map { $_->{name} => $_->{value} }
-        @{ main::parse_var_list("editor\tcaf\xC3\xA9\nworkspace\tmyproj\n") };
+        @{ main::parse_var_list("editor\tcaf\x{E9}\nworkspace\tmyproj\n") };
     my $sessions = [
         { name => "caf\x{e9}-myproj", attachments => [
             { session_name_template => '{editor}-{workspace}', pid => 1 } ] },
@@ -1572,6 +1568,29 @@ subtest 'parse_args: a second positional is a usage error' => sub {
     like($err, qr/\bextra\b/, 'the offending argument is named');
 };
 
+subtest "shperl's own literals are characters, so output encodes them once" => sub {
+    # The empty vars view's hint holds an em dash. As three raw bytes it
+    # would be encoded a second time on the way out and miscounted as
+    # three columns.
+    my $m = make_vars_model();
+    $m->{vars}{list} = [];
+    like(main::render_vars($m, 80, 6), qr/no variables \x{2014} shpool/,
+        'the em dash is one character');
+};
+
+subtest 'parse_args: a UTF-8 session name is decoded to characters' => sub {
+    # As the shell hands it over: "é" is the two bytes \xC3\xA9. It has
+    # to compare equal to the decoded name in shpool's list.
+    my ($session, $err) = parse_argv("caf\xC3\xA9");
+    is($err,     '',          'no error');
+    is($session, "caf\x{e9}", 'decoded to café');
+};
+
+subtest 'parse_args: an argument that is not UTF-8 is rejected' => sub {
+    my ($session, $err) = parse_argv('--socket', "/tmp/caf\xE9");
+    like($err, qr/valid UTF-8/, 'dies rather than rewriting the path');
+};
+
 subtest 'parse_args: an empty session name is rejected' => sub {
     # `shp host ""` would otherwise reach shpool as an empty name.
     my ($session, $err) = parse_argv('');
@@ -1721,6 +1740,16 @@ subtest 'run_capture separates the two streams and reports exit status' => sub {
         main::run_capture($^X, '-e', 'print STDERR "boom"; exit 3');
     ok(!$ok2, 'nonzero exit reported as failure');
     is($err2, 'boom', 'stderr still captured on failure');
+};
+
+subtest 'run_capture encodes arguments and decodes both streams as UTF-8' => sub {
+    # "caf\x{e9}" here is stored as Latin-1, which exec would pass as the
+    # lone byte \xe9 if run_capture didn't encode it.
+    my ($ok, $out, $err) = main::run_capture($^X, '-e',
+        'print STDOUT $ARGV[0]; print STDERR $ARGV[0]', "caf\x{e9}");
+    ok($ok, 'child exited cleanly');
+    is($out, "caf\x{e9}", 'stdout: the argument made the round trip as UTF-8');
+    is($err, "caf\x{e9}", 'stderr decoded too');
 };
 
 subtest 'run_capture drains both streams without deadlocking' => sub {
