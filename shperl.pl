@@ -1830,12 +1830,10 @@ sub shell_attach {
     my ($m, $name, $force) = @_;
     # 2J + H: clear visible area and home the cursor so the user's
     # freshly-attached shell starts on a clean viewport. No \e[3J —
-    # preserve scrollback. 22;0t + OSC 0: push the caller's title and
-    # title the window with the session's name, which shows until the
-    # session sets a title of its own. 23;0t pops it once we're
-    # detached, so the title the session left behind doesn't leak
-    # past it.
-    print STDOUT "\e[2J\e[H\e[22;0t\e]0;$name\a";
+    # preserve scrollback. 22;0t pushes the caller's title and 23;0t
+    # pops it once we're detached, so whatever title the session sets
+    # (or shpool's vterm engine replays on attach) doesn't leak past it.
+    print STDOUT "\e[2J\e[H\e[22;0t";
     my @cmd = encode_argv(attach_cmd($name, $force));
     teardown_events($m);
     my $rc = system @cmd;

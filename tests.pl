@@ -1774,9 +1774,9 @@ subtest 'run_capture drains both streams without deadlocking' => sub {
 };
 
 # ---------------------------------------------------------------------------
-# Window title. The table and each attached session push the terminal's
-# title, set their own, and pop it again, so the window names whichever
-# is up and never shows a title left over from the previous one.
+# Window title. The table pushes the terminal's title, sets its own and
+# pops it again; each attach pushes and pops around the session, so a
+# title the session sets never outlives it.
 # ---------------------------------------------------------------------------
 
 subtest 'title: the table and each attach bracket the title stack' => sub {
@@ -1806,11 +1806,11 @@ subtest 'title: the table and each attach bracket the title stack' => sub {
         push @ops, defined $2 ? "set $2" : $1 eq '22' ? 'push' : 'pop';
     }
     is_deeply(\@ops, [
-        'push', 'set foo',    'pop',    # shperl foo
+        'push',               'pop',    # shperl foo
         'push', 'set shperl', 'pop',    # table; Enter on foo
-        'push', 'set foo',    'pop',    # attached again
+        'push',               'pop',    # attached again
         'push', 'set shperl', 'pop',    # table; q
-    ], 'every phase pushes, titles itself, and pops');
+    ], 'the table titles itself; an attach leaves the title to the session');
 };
 
 # ---------------------------------------------------------------------------
