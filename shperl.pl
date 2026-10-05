@@ -39,8 +39,8 @@ our $WINCH_PENDING;
 END {
     # ?1004l: disable focus reporting before the alt-screen flip so the
     # terminal isn't briefly emitting focus bytes into the user's shell
-    # on the way out.
-    print STDOUT "\e[?25h\e[?7h\e[?1004l\e[?1049l" if $IN_ALT;
+    # on the way out. 23;0t restores the title tty_enter_alt pushed.
+    print STDOUT "\e[?25h\e[?7h\e[?1004l\e[?1049l\e[23;0t" if $IN_ALT;
     if (defined $SAVED_STTY) {
         system 'stty', $SAVED_STTY;
     }
@@ -1096,8 +1096,13 @@ sub tty_enter_alt {
     # terminal sends ESC [ I when it regains focus (parsed as a
     # silent refresh) and ESC [ O when it loses focus (discarded).
     # Best-effort — terminals without focus-reporting support ignore
-    # the enable sequence.
-    print STDOUT "\e[?1049h\e[?25l\e[?1l\e[?7l\e[?1004h";
+    # the enable sequence. 22;0t + OSC 0: push the window title (and
+    # icon name) onto the terminal's title stack and title the window
+    # "shperl" while the table is up, so it doesn't keep showing
+    # whatever the last attached session set. Terminals without a
+    # title stack ignore 22/23t; on those the "shperl" title outlives
+    # us until the shell sets its own.
+    print STDOUT "\e[22;0t\e]0;shperl\a\e[?1049h\e[?25l\e[?1l\e[?7l\e[?1004h";
     $IN_ALT = 1;
 }
 
@@ -1105,8 +1110,9 @@ sub tty_leave_alt {
     # Mirror tty_enter_alt: turn focus reporting off before the
     # alt-screen exit so the terminal isn't briefly emitting focus
     # bytes into whatever consumes stdin next (the user's shell, or
-    # the upcoming `shpool attach` child).
-    print STDOUT "\e[?25h\e[?7h\e[?1004l\e[?1049l";
+    # the upcoming `shpool attach` child). 23;0t pops the title
+    # tty_enter_alt pushed.
+    print STDOUT "\e[?25h\e[?7h\e[?1004l\e[?1049l\e[23;0t";
     $IN_ALT = 0;
 }
 
@@ -1776,11 +1782,16 @@ sub shell_attach {
     my ($m, $name, $force) = @_;
     # 2J + H: clear visible area and home the cursor so the user's
     # freshly-attached shell starts on a clean viewport. No \e[3J —
-    # preserve scrollback.
-    print STDOUT "\e[2J\e[H";
+    # preserve scrollback. 22;0t + OSC 0: push the caller's title and
+    # title the window with the session's name, which shows until the
+    # session sets a title of its own. 23;0t pops it once we're
+    # detached, so the title the session left behind doesn't leak
+    # past it.
+    print STDOUT "\e[2J\e[H\e[22;0t\e]0;$name\a";
     my @cmd = attach_cmd($name, $force);
     teardown_events($m);
     my $rc = system @cmd;
+    print STDOUT "\e[23;0t";
     ensure_events($m);
     return $rc == 0;
 }

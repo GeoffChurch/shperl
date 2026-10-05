@@ -1744,4 +1744,44 @@ subtest 'run_capture drains both streams without deadlocking' => sub {
     is(length($err // ''), $big, 'all of stderr captured');
 };
 
+# ---------------------------------------------------------------------------
+# Window title. The table and each attached session push the terminal's
+# title, set their own, and pop it again, so the window names whichever
+# is up and never shows a title left over from the previous one.
+# ---------------------------------------------------------------------------
+
+subtest 'title: the table and each attach bracket the title stack' => sub {
+    # The real run_tui and shell_attach, with only the tty, the daemon
+    # and the attach command stubbed: startup attach to foo, a table
+    # where Enter re-attaches to foo, then a table that quits.
+    my $m = main::model_new();
+    my @actions = (['attach', 'foo'], ['quit']);
+    my $out = '';
+    {
+        no warnings qw(redefine once);
+        local *main::fetch_sessions  = sub { [ session_record('foo', 100) ] };
+        local *main::tty_enter_raw   = sub {};
+        local *main::tty_leave_raw   = sub {};
+        local *main::event_loop      = sub { shift @actions };
+        local *main::teardown_events = sub {};
+        local *main::ensure_events   = sub {};
+        local *main::attach_cmd      = sub { ('true') };
+        local $SIG{WINCH};
+        open my $fh, '>', \$out or die "open in-memory stdout: $!";
+        local *STDOUT = $fh;
+        main::run_tui($m, 'foo');
+        close $fh;
+    }
+    my @ops;
+    while ($out =~ /\e\[(22|23);0t|\e\]0;([^\a]*)\a/g) {
+        push @ops, defined $2 ? "set $2" : $1 eq '22' ? 'push' : 'pop';
+    }
+    is_deeply(\@ops, [
+        'push', 'set foo',    'pop',    # shperl foo
+        'push', 'set shperl', 'pop',    # table; Enter on foo
+        'push', 'set foo',    'pop',    # attached again
+        'push', 'set shperl', 'pop',    # table; q
+    ], 'every phase pushes, titles itself, and pops');
+};
+
 done_testing();
