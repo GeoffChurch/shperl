@@ -1813,4 +1813,95 @@ subtest 'title: the table and each attach bracket the title stack' => sub {
     ], 'every phase pushes, titles itself, and pops');
 };
 
+# ---------------------------------------------------------------------------
+# Column width. Layout counts terminal columns: a CJK character fills
+# two, a combining accent none. The frame tests below check the property
+# a miscount breaks -- every full-width row exactly fills the screen,
+# and columns line up across names of different widths -- rather than
+# golden text, so a future character-counting pad shows up wherever it
+# lands.
+# ---------------------------------------------------------------------------
+
+subtest 'str_width counts terminal columns' => sub {
+    for my $case (
+        [ 'web',               3, 'ASCII' ],
+        [ "caf\x{e9}",         4, 'precomposed accent' ],
+        [ "cafe\x{301}",       4, 'combining accent takes no column' ],
+        [ "\x{65E5}\x{672C}",  4, 'CJK ideographs are wide' ],
+        [ "\x{FF41}",          2, 'fullwidth Latin is wide' ],
+        [ "\x{FF8A}",          1, 'halfwidth katakana is narrow' ],
+        [ "\x{2764}\x{FE0F}",  2, 'VS16 asks for emoji presentation' ],
+        [ "\x{1F468}\x{200D}\x{1F469}\x{200D}\x{1F467}", 2,
+          'a ZWJ sequence is one wide cluster' ],
+        [ "\x{1F1EF}\x{1F1F5}", 2, 'a flag is one wide cluster' ],
+    ) {
+        my ($s, $want, $what) = @$case;
+        is(main::str_width($s), $want, $what);
+    }
+};
+
+# The frame's rows with escapes and line endings stripped.
+sub frame_rows {
+    my @rows = split /\r\n/, strip_ansi(shift);
+    return grep { length } @rows;
+}
+
+sub wide_session_model {
+    my @names = @_;
+    my $m = main::model_new();
+    main::model_refresh($m, [ map { session_record($_, 100) } @names ]);
+    $m->{selected} = 1;
+    return $m;
+}
+
+subtest 'render: wide names fill rows exactly and keep columns aligned' => sub {
+    my $m = wide_session_model('web', "cafe\x{301}", "\x{65E5}\x{672C}\x{8A9E}",
+        "\x{1F468}\x{200D}\x{1F469}\x{200D}\x{1F467}");
+    $m->{error} = "session '\x{65E5}\x{672C}\x{8A9E}' is gone";
+    my @rows = frame_rows(main::render($m, 40, 10));
+    is(scalar @rows, 7, 'title, header, four sessions, bottom bar');
+    is_deeply([ map { main::str_width($_) } @rows ], [ (40) x 7 ],
+        'every row is exactly 40 columns');
+    # Names hold no whitespace, so the created column starts after the
+    # 2-column marker, the name and its padding.
+    my ($header) = grep { /\bcreated\b/ } @rows;
+    my $col = main::str_width(substr($header, 0, index($header, 'created')));
+    for my $row (@rows[2 .. 5]) {
+        my ($lead) = $row =~ /^(..\S+ +)\S/;
+        is(main::str_width($lead), $col, "created column aligned: $row");
+    }
+};
+
+subtest 'render: clipping drops a wide character whole' => sub {
+    # At 9 columns the 4th ideograph of the name would need columns 9-10,
+    # and the error's would straddle the bar's edge likewise.
+    my $cjk = "\x{65E5}\x{672C}\x{8A9E}" x 2;
+    my $m = wide_session_model('web', $cjk);
+    $m->{error} = "$cjk$cjk";
+    my @rows = frame_rows(main::render($m, 9, 6));
+    is_deeply([ map { main::str_width($_) } @rows ], [ (9) x scalar @rows ],
+        'every row is exactly 9 columns, the dropped half-column padded');
+};
+
+subtest 'render_vars: wide values fill the selected row; preview columns align' => sub {
+    my $wide = "\x{65E5}\x{672C}";
+    my $m = main::model_new();
+    $m->{mode} = 'vars';
+    $m->{vars}{list} = [ { name => 'w', value => $wide } ];
+    $m->{vars}{sel}  = 0;
+    $m->{sessions} = [
+        { name => "$wide-edit", attachments => [
+            { session_name_template => "{w}-$wide", pid => 111 } ] },
+        { name => 'x-edit', attachments => [
+            { session_name_template => '{w}-edit', pid => 222 } ] },
+    ];
+    my @rows = frame_rows(main::render($m, 60, 10));
+    my ($sel) = grep { /^ > w = / } @rows;
+    is(main::str_width($sel), 60, 'selected variable row is exactly 60 columns');
+    my @pids = map { main::str_width(substr($_, 0, index($_, 'pid'))) }
+        grep { /pid \d/ } @rows;
+    is(scalar @pids, 2, 'two preview rows');
+    is($pids[0], $pids[1], 'pid column aligned across templates of different widths');
+};
+
 done_testing();

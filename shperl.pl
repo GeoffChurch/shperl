@@ -1134,7 +1134,36 @@ sub tty_size {
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
-# A label is [ styled_bytes, visible_chars ]. The visible count is
+# Layout counts terminal columns, not characters. str_width measures
+# per grapheme cluster: 2 for East Asian Wide/Fullwidth, an emoji
+# presentation selector (VS16) or a flag; 0 for a cluster that is only
+# a combining or format character; 1 otherwise. glibc's wcswidth and
+# tmux 3.7 agree with all of that except on emoji sequences (a ZWJ
+# family, a skin tone): this counts one wide cluster, as tmux does,
+# where glibc counts per code point. ASCII skips the regexes.
+sub str_width {
+    my $s = shift;
+    return length $s if $s !~ /[^\x00-\x7f]/;
+    my $w = 0;
+    $w += cluster_width($_) for $s =~ /\X/g;
+    return $w;
+}
+
+sub cluster_width {
+    my $g = shift;
+    return 2 if $g =~ /[\p{East_Asian_Width=Wide}\p{East_Asian_Width=Fullwidth}\x{FE0F}\p{Regional_Indicator}]/;
+    return 0 if $g =~ /^[\p{Mn}\p{Me}\p{Cf}]/;
+    return 1;
+}
+
+# sprintf's %-*s pads to a character count; this pads to columns.
+sub pad_right {
+    my ($s, $w) = @_;
+    my $short = $w - str_width($s);
+    return $short > 0 ? $s . (' ' x $short) : $s;
+}
+
+# A label is [ styled_bytes, visible_columns ]. The visible width is
 # tracked separately from the styled bytes so the bar's trailing space
 # fill can be sized without parsing ANSI.
 
@@ -1143,19 +1172,19 @@ sub label_new { return [ '', 0 ]; }
 sub label_push_plain {
     my ($l, $s) = @_;
     $l->[0] .= $SGR_AMBER_DIM . $s . $SGR_BAR_FG_RESET;
-    $l->[1] += length $s;
+    $l->[1] += str_width $s;
 }
 
 sub label_push_key {
     my ($l, $s) = @_;
     $l->[0] .= $SGR_AMBER . $s . $SGR_BAR_FG_RESET;
-    $l->[1] += length $s;
+    $l->[1] += str_width $s;
 }
 
 sub label_push_error {
     my ($l, $s) = @_;
     $l->[0] .= $SGR_ERROR . $s . $SGR_BAR_FG_RESET;
-    $l->[1] += length $s;
+    $l->[1] += str_width $s;
 }
 
 sub title_label {
@@ -1286,23 +1315,27 @@ sub vars_bottom_label {
     return $l;
 }
 
-# Clip a styled (ANSI+text) string so visible characters don't exceed
-# `max_visible`. ESC [ ... <final> sequences pass through verbatim —
-# they don't count as visible width, but they stay with their text.
+# Clip a styled (ANSI+text) string to `max_visible` columns, returning
+# the clipped string and the columns it fills. ESC [ ... <final>
+# sequences pass through verbatim — they don't count as visible width,
+# but they stay with their text. A wide character that would straddle
+# the edge is dropped whole. ESC is always a grapheme cluster of its
+# own, so walking clusters still sees every escape byte.
 sub clip_styled {
     my ($styled, $max_visible) = @_;
     my $out = '';
     my $visible = 0;
     my $esc = 0;        # 0 normal, 1 saw ESC, 2 inside CSI
-    for my $ch (split //, $styled) {
+    for my $ch ($styled =~ /\X/g) {
         if ($esc == 0) {
             if ($ch eq "\e") {
                 $out .= $ch;
                 $esc = 1;
             } else {
-                last if $visible >= $max_visible;
+                my $cw = cluster_width($ch);
+                last if $visible + $cw > $max_visible;
                 $out .= $ch;
-                $visible++;
+                $visible += $cw;
             }
         }
         elsif ($esc == 1) {
@@ -1315,7 +1348,7 @@ sub clip_styled {
             $esc = 0 if $o >= 0x40 && $o <= 0x7e;
         }
     }
-    return $out;
+    return ($out, $visible);
 }
 
 # Render one chrome bar: styled label embedded in a bar background,
@@ -1324,20 +1357,18 @@ sub clip_styled {
 sub render_bar {
     my ($width, $label, $align) = @_;
     my ($styled, $visible) = @$label;
-    my ($lead, $trail);
+    my $lead = 2;
     if ($align eq 'center') {
         my $slack = $width - $visible;
         $slack = 0 if $slack < 0;
         $lead  = int($slack / 2);
-        $trail = $slack - $lead;
-    } else {
-        $lead  = 2;
-        my $rem = $width - ($lead + $visible);
-        $trail = $rem < 0 ? 0 : $rem;
     }
     my $avail = $width - $lead;
     $avail = 0 if $avail < 0;
-    my $clipped = clip_styled($styled, $avail);
+    # Sized from the clipped width, not the label's: a wide character
+    # dropped at the edge would otherwise leave the bar a column short.
+    my ($clipped, $kept) = clip_styled($styled, $avail);
+    my $trail = $avail - $kept;
     return $SGR_BAR_BG
          . (' ' x $lead)
          . $clipped
@@ -1413,10 +1444,19 @@ my $COL_CREATED  = 'created';
 my $COL_ACTIVE   = 'active';
 my $COL_GAP      = 2;
 
+# Clip to $max columns. A wide character that would straddle the edge
+# is dropped whole, leaving the row a column short for the caller's pad.
 sub clip_plain {
     my ($s, $max) = @_;
-    return $s if length $s <= $max;
-    return substr($s, 0, $max);
+    return substr($s, 0, $max) if $s !~ /[^\x00-\x7f]/;
+    my ($out, $w) = ('', 0);
+    for my $g ($s =~ /\X/g) {
+        my $gw = cluster_width($g);
+        last if $w + $gw > $max;
+        $out .= $g;
+        $w   += $gw;
+    }
+    return $out;
 }
 
 # Widest session name, floored at len("name") so the header line is
@@ -1425,7 +1465,7 @@ sub name_column_width {
     my $sessions = shift;
     my $w = 4;     # len("name")
     for my $s (@$sessions) {
-        my $len = length $s->{name};
+        my $len = str_width $s->{name};
         $w = $len if $len > $w;
     }
     return $w;
@@ -1460,9 +1500,9 @@ sub session_row {
     my $created = format_age($now, $s->{started_at_unix_ms} // 0);
     my $active  = format_age($now, last_touched_ms($s));
     my $text = clip_plain(
-        sprintf("%s%s%-*s%s%-*s%s%-*s",
+        sprintf("%s%s%s%s%-*s%s%-*s",
             $dot, $arrow,
-            $name_width,           $s->{name},
+            pad_right($s->{name}, $name_width),
             $gap,
             length($COL_CREATED),  $created,
             $gap,
@@ -1470,8 +1510,8 @@ sub session_row {
         $w,
     );
     return $is_selected
-        ? sprintf("%s%-*s%s\r\n", $SGR_SELECTED, $w, $text, $SGR_RESET)
-        : sprintf("%-*s\r\n", $w, $text);
+        ? $SGR_SELECTED . pad_right($text, $w) . "$SGR_RESET\r\n"
+        : pad_right($text, $w) . "\r\n";
 }
 
 # Bottom-bar contents. Modal prompts outrank errors: the user is
@@ -1580,7 +1620,7 @@ sub vars_list_lines {
     my ($m, $w) = @_;
     my $vlist = $m->{vars}{list};
     my $nw = 0;
-    for my $v (@$vlist) { my $n = length $v->{name}; $nw = $n if $n > $nw; }
+    for my $v (@$vlist) { my $n = str_width $v->{name}; $nw = $n if $n > $nw; }
     my @lines;
     for my $i (0 .. $#$vlist) {
         my $v     = $vlist->[$i];
@@ -1588,12 +1628,13 @@ sub vars_list_lines {
         my $arrow = $sel ? '>' : ' ';
         my $count = scalar attachments_for_var($m->{sessions}, $v->{name});
         my $tail  = sprintf('   (%d session%s)', $count, $count == 1 ? '' : 's');
+        my $name  = pad_right($v->{name}, $nw);
         my $row   = $v->{unset}
-            ? sprintf(' %s %-*s   (unset)%s', $arrow, $nw, $v->{name}, $tail)
-            : sprintf(' %s %-*s = %s%s',      $arrow, $nw, $v->{name}, $v->{value}, $tail);
+            ? " $arrow $name   (unset)$tail"
+            : " $arrow $name = $v->{value}$tail";
         $row = clip_plain($row, $w);
         my $line = $sel
-            ? sprintf('%s%-*s%s', $SGR_SELECTED, $w, $row, $SGR_RESET)
+            ? $SGR_SELECTED . pad_right($row, $w) . $SGR_RESET
             : $row;
         # Dim the (unset) marker as a post-pad substitution so the
         # width/clip accounting above stays on plain text. On the
@@ -1625,7 +1666,7 @@ sub vars_cand_lines {
         my $arrow = $i == $m->{vars}{highlight} ? '>' : ' ';
         my $row = clip_plain(sprintf(' %s %s', $arrow, $shown->[$i]), $w);
         push @lines, $i == $m->{vars}{highlight}
-            ? sprintf('%s%-*s%s', $SGR_SELECTED, $w, $row, $SGR_RESET)
+            ? $SGR_SELECTED . pad_right($row, $w) . $SGR_RESET
             : $row;
     }
     return @lines;
@@ -1646,8 +1687,8 @@ sub vars_preview_lines {
         push @lines, "  {$sel->{name}} attachments:";
         for my $a (@hits) {
             my $after = resolve_template($a->{template}, \%vmap);
-            my $row = sprintf('    %-24s %-16s pid %s',
-                $a->{template}, $a->{session}, $a->{pid});
+            my $row = '    ' . pad_right($a->{template}, 24)
+                    . ' '    . pad_right($a->{session}, 16) . " pid $a->{pid}";
             $row .= "  -> $after" if defined $target && $after ne $a->{session};
             push @lines, clip_plain($row, $w);
         }
