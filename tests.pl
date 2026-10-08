@@ -1814,6 +1814,31 @@ subtest 'title: the table and each attach bracket the title stack' => sub {
 };
 
 # ---------------------------------------------------------------------------
+# Events EOF: the message tells a stream the daemon ended (D resubscribes)
+# from a subscriber that never subscribed (D can't help), by its exit.
+# ---------------------------------------------------------------------------
+
+subtest 'events EOF: the subscriber exit status picks the message' => sub {
+    for my $case (
+        [ 0, qr/press D/,  'a clean exit (daemon ended the stream) offers D' ],
+        [ 1, qr/restart/,  'a failed exit (never subscribed) asks for a daemon restart' ],
+    ) {
+        my ($code, $want, $label) = @$case;
+        my $m = main::model_new();
+        # The real event_loop sequence: read the pipe to EOF, then tear down.
+        $m->{events_pid} = open my $fh, '-|', 'sh', '-c', "exit $code"
+            or die "spawn: $!";
+        $m->{events_fh} = $fh;
+        1 while sysread $fh, my $junk, 4096;
+        my $status = main::teardown_events($m);
+        is($status, $code << 8, "exit $code: teardown reports the child's own status");
+        like(main::events_eof_message($status), $want, $label);
+        unlike(main::events_eof_message($status), qr/press D/, 'no D hint where D cannot help')
+            if $code;
+    }
+};
+
+# ---------------------------------------------------------------------------
 # Column width. Layout counts terminal columns: a CJK character fills
 # two, a combining accent none. The frame tests below check the property
 # a miscount breaks -- every full-width row exactly fills the screen,

@@ -1749,7 +1749,8 @@ sub cancel_modal_if_target_gone {
 # stderr before exec. The child can fail for several reasons — binary
 # doesn't have the subcommand (older shpool), daemon isn't running,
 # daemon predates the events socket, etc. — and they all converge on
-# EOF on the pipe, which event_loop handles uniformly. We don't probe
+# EOF on the pipe with a failed exit, which event_loop tells apart from
+# the daemon ending the stream by the exit status alone. We don't probe
 # capability up front: the subscribe attempt itself is the cheapest,
 # most accurate signal, and the EOF path is the same fallback either
 # way. Returns (pid, fh) or (undef, undef) on fork failure.
@@ -1777,18 +1778,36 @@ sub ensure_events {
     $EVENTS_PID = $m->{events_pid};
 }
 
-# Stop the events subscriber and reap it. SIGTERM the child even if
-# it has already exited on its own (e.g. the daemon dropped us);
-# waitpid then just reaps the zombie.
+# Stop the events subscriber and reap it, returning its wait status.
+# SIGTERM the child even if it has already exited on its own (e.g. the
+# daemon dropped us); waitpid then just reaps the zombie, and the
+# status is the child's own exit. Read before the close, which waits
+# again on the piped handle and would leave $? at -1.
 sub teardown_events {
     my $m = shift;
     return unless defined $m->{events_pid};
     kill 'TERM', $m->{events_pid};
     waitpid $m->{events_pid}, 0;
+    my $status = $?;
     close $m->{events_fh} if defined $m->{events_fh};
     $m->{events_pid} = undef;
     $m->{events_fh}  = undef;
     $EVENTS_PID      = undef;
+    return $status;
+}
+
+# The bottom-bar message for a subscriber that hit EOF, from its wait
+# status. A clean exit means the daemon ended the stream (it shut down,
+# or dropped us as a slow subscriber), and D subscribes afresh. A
+# failure means `shpool events` never subscribed. The message only
+# shows once refresh_sessions has reached the daemon (its own error
+# outranks this one), so the daemon is up and its events socket is
+# what's missing or dead; D can't rebind that, only a daemon restart.
+sub events_eof_message {
+    my $status = shift;
+    return $status == 0
+        ? 'shpool events: stream ended — press D to resubscribe'
+        : "shpool events: can't subscribe — restart the daemon";
 }
 
 # shpool command argv builders. Each inserts `--` before the
@@ -1932,16 +1951,16 @@ sub event_loop {
             if (!defined $got) {
                 die "read events: $!" unless $!{EINTR};
             } elsif ($got == 0) {
-                # EOF — daemon went away, slow-subscriber drop, etc.
-                # Reap; don't auto-respawn (ensure_events from
-                # shell_attach/EnsureDaemon retries on its own —
+                # EOF — the daemon ended the stream, or the subscriber
+                # never got one. Reap; don't auto-respawn (ensure_events
+                # from shell_attach/EnsureDaemon retries on its own —
                 # auto-retry here risks a tight loop if the daemon
                 # is genuinely down).
-                teardown_events($m);
+                my $status = teardown_events($m);
                 refresh_sessions($m);
                 # Don't clobber a more informative error from
                 # refresh_sessions itself (e.g. "shpool list: ...").
-                model_set_error($m, 'events subscription dropped — press D to retry')
+                model_set_error($m, events_eof_message($status))
                     unless defined $m->{error};
             } else {
                 refresh_sessions($m);
