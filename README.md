@@ -78,7 +78,7 @@ Keys:
 | `v`           | manage `shpool` template variables                  |
 | `q` / `C-c`   | quit `shperl` (doesn't affect sessions)                   |
 
-Detaching from a `shpool` session (`C-S C-q`, or however you've configured it) returns you to `shperl`.
+Detaching from a `shpool` session (`C-SPC C-q` by default, or however you've configured it) returns you to `shperl`.
 
 The session list also auto-refreshes when the terminal regains focus, so switching back from another window picks up sessions added/killed elsewhere without a keystroke.
 
