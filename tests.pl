@@ -1929,4 +1929,29 @@ subtest 'render_vars: wide values fill the selected row; preview columns align' 
     is($pids[0], $pids[1], 'pid column aligned across templates of different widths');
 };
 
+# ---------------------------------------------------------------------------
+# Missing-module check
+# ---------------------------------------------------------------------------
+
+subtest 'module check lists exactly the modules shperl uses' => sub {
+    open my $fh, '<', "$FindBin::Bin/shperl.pl" or die "shperl.pl: $!";
+    my @used = map { /^use ([A-Z][\w:]*)/ ? $1 : () } <$fh>;
+    is_deeply([sort @main::MODULES], [sort @used], 'same modules as the use lines');
+};
+
+subtest 'missing modules are all named, without the @INC dump' => sub {
+    # Load the pragmas first, then empty @INC so perl itself fails to
+    # find every module in the list.
+    my $code = 'BEGIN { require strict; require warnings; require utf8; @INC = () }'
+             . ' open STDERR, ">&", \*STDOUT; require $ARGV[0]';
+    open my $fh, '-|', $^X, '-e', $code, "$FindBin::Bin/shperl.pl"
+        or die "spawning perl: $!";
+    my $out = do { local $/; <$fh> };
+    close $fh;
+    is($? >> 8, 1, 'exits 1');
+    like($out, qr/^shperl: missing Perl modules: \Q@{[join ', ', @main::MODULES]}\E$/m,
+         'names every module');
+    unlike($out, qr/\@INC/, 'no @INC dump');
+};
+
 done_testing();

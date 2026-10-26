@@ -3,11 +3,39 @@
 # --json`, `shpool attach`, `shpool kill`, and (when available) `shpool
 # events` behind a raw-mode terminal interface.
 #
-# Core-only dependencies: JSON::PP, POSIX, Time::HiRes.
+# Depends only on perl and its standard modules (@MODULES below).
 
 use strict;
 use warnings;
 use utf8;    # string literals hold characters, like everything else in here
+
+# Every module shperl uses ships with perl, but some systems package
+# perl as a minimal core with the rest of its standard modules apart.
+# Try them all before the `use` lines so the user learns every missing
+# one at once, by name, rather than perl stopping at the first with a
+# dump of @INC. A module that is present but fails to load keeps
+# perl's own error. tests.pl checks this list against the `use` lines.
+our @MODULES;
+BEGIN {
+    @MODULES = qw(Getopt::Long JSON::PP Encode POSIX Time::HiRes);
+    my @missing;
+    for my $module (@MODULES) {
+        (my $file = "$module.pm") =~ s{::}{/}g;
+        next if eval { require $file; 1 };
+        die $@ unless $@ =~ /^Can't locate \Q$file\E in \@INC/;
+        push @missing, $module;
+    }
+    if (@missing) {
+        local $" = ', ';
+        print STDERR <<"EOM";
+shperl: missing Perl modules: @missing
+        They are part of standard Perl, but this system's perl was
+        installed without them. Install its full perl package, or the
+        packages that provide these modules.
+EOM
+        exit 1;
+    }
+}
 use Getopt::Long qw(GetOptions);
 use JSON::PP ();
 use Encode qw(decode_utf8 encode_utf8);
