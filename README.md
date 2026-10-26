@@ -39,15 +39,15 @@ Press `v` to manage `shpool`'s template variables and their attached sessions.
 ## Install
 
 1. [Install `shpool`](https://github.com/shell-pool/shpool#installation)
-2. Set your table with whatever flavor you like:
+2. Run `shperl`:
 
-   - *L'amuse-bouche*
+   - It's a standalone script, so it can be executed directly from GitHub without installing anything (you might want to pin a particular commit):
 
      ```bash
      perl -e "$(curl -fsSL https://raw.githubusercontent.com/GeoffChurch/shperl/main/shperl.pl)"
      ```
 
-   - *Le plat de résistance*
+   - Or you can download it somewhere on your path, like `~/.local/bin/shperl`:
 
      ```bash
      DEST=~/.local/bin/shperl
