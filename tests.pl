@@ -11,6 +11,7 @@ use lib $FindBin::Bin;
 use Test::More;
 
 require "$FindBin::Bin/shperl.pl";
+require "$FindBin::Bin/screenshots/generate.pl";
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1184,6 +1185,22 @@ subtest 'golden: session list with window titles, clipped at the edge' => sub {
   logs  1h       1h      tail -f /var/log/a-very-long-path/t
   j down   k up   spc attach   n new   d kill   D daemon   v
 GOLDEN
+};
+
+# The README's screenshots are drawn from shperl's render, so a change
+# to the rendering fails here until they're regenerated.
+subtest 'README screenshots are current' => sub {
+    open my $fh, '<', "$FindBin::Bin/README.md" or die "README.md: $!";
+    my $readme = do { local $/; <$fh> };
+    for my $shot (main::screenshots()) {
+        my $path = "$FindBin::Bin/$shot->{path}";
+        open my $svg_fh, '<:encoding(UTF-8)', $path or die "$path: $!";
+        my $committed = do { local $/; <$svg_fh> };
+        ok($committed eq main::screenshot_svg($shot),
+            "$shot->{path} matches the render (else run screenshots/generate.pl)");
+        like($readme, qr/\Q![$shot->{alt}]($shot->{path})\E/,
+            "README shows $shot->{path}");
+    }
 };
 
 subtest 'display_title makes a window title safe to draw' => sub {

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="716.8" height="208" viewBox="0 0 716.8 208" role="img" aria-label="variables view">
+<rect width="716.8" height="208" rx="8" fill="#1e1e1e"/>
+<g font-family="SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', 'Noto Sans Mono', 'Liberation Mono', monospace" font-size="14">
+<rect x="14" y="14" width="688.8" height="18" fill="#303030"/>
+<text x="299.6 308 316.4 324.8 333.2 341.6 350 358.4 366.8 383.6 392 400.4" y="28" fill="#ebb95a" font-weight="bold">variables(2)</text>
+<rect x="14" y="32" width="688.8" height="18" fill="#d4d4d4"/>
+<text x="22.4 39.2 47.6 56 64.4 98 114.8 123.2 131.6 140 148.4 156.8 165.2 173.6 207.2 215.6 232.4 240.8 249.2 257.6 266 274.4 282.8 291.2" y="46" fill="#1e1e1e">&gt;acct=personal(1session)</text>
+<text x="39.2 47.6 56 64.4 72.8 81.2 98 114.8 123.2 131.6 165.2 173.6 190.4 198.8 207.2 215.6 224 232.4 240.8 249.2" y="64" fill="#d4d4d4">editor=vim(1session)</text>
+<text x="30.8 39.2 47.6 56 64.4 72.8 81.2 89.6 98 114.8 123.2 131.6 140 148.4 156.8 165.2" y="82" fill="#d4d4d4">candidatevalues:</text>
+<text x="39.2 47.6 56 64.4 72.8 81.2 89.6 98" y="100" fill="#d4d4d4">personal</text>
+<rect x="14" y="104" width="688.8" height="18" fill="#d4d4d4"/>
+<text x="22.4 39.2 47.6 56 64.4" y="118" fill="#1e1e1e">&gt;work</text>
+<text x="30.8 39.2 47.6 56 64.4 72.8 89.6 98 106.4 114.8 123.2 131.6 140 148.4 156.8 165.2 173.6 182" y="154" fill="#d4d4d4">{acct}attachments:</text>
+<text x="47.6 56 64.4 72.8 81.2 89.6 98 106.4 114.8 123.2 131.6 257.6 266 274.4 282.8 291.2 299.6 308 316.4 324.8 333.2 341.6 350 358.4 400.4 408.8 417.2 434 442.4 450.8 459.2 484.4 492.8 509.6 518 526.4 534.8 543.2 551.6 560 568.4 576.8" y="172" fill="#d4d4d4">{acct}-mailpersonal-mailpid2718-&gt;work-mail</text>
+<rect x="14" y="176" width="688.8" height="18" fill="#303030"/>
+<text x="30.8 39.2 47.6" y="190" fill="#82694b">set</text>
+<text x="64.4 72.8 81.2 89.6" y="190" fill="#ebb95a" font-weight="bold">acct</text>
+<text x="106.4" y="190" fill="#82694b">=</text>
+<text x="123.2 131.6 140 148.4" y="190" fill="#ebb95a" font-weight="bold">work</text>
+<text x="156.8 190.4" y="190" fill="#82694b">_(</text>
+<text x="198.8 207.2 215.6" y="190" fill="#ebb95a" font-weight="bold">ret</text>
+<text x="224 240.8 249.2 257.6 266 274.4 282.8" y="190" fill="#82694b">:apply,</text>
+<text x="299.6 308 316.4" y="190" fill="#ebb95a" font-weight="bold">esc</text>
+<text x="324.8 341.6 350 358.4 366.8 375.2 383.6 392" y="190" fill="#82694b">:cancel)</text>
+</g>
+</svg>

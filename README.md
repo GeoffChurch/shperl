@@ -6,35 +6,16 @@ A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel]
 
 `shperl` arranges your `shpool` sessions in a comely table. Select, create, kill, and attach to sessions with mere keystrokes. Upon detaching, you will find yourself back at the table. Starting/quitting `shperl` has no effect on your `shpool` sessions, so you can run `shperl` in multiple terminals or tmux panes.
 
-## What it looks like (colors/highlighting in terminal)
+## What it looks like
 
-```
-                             shpool (3 sessions)
-  name       created  active  title
-*>mail       5h       now     NeoMutt with 2481 messages [12 NEW]
-  vim        10m      4m      nvme0n1 (/dev) - VIM
-* djt-miner  1461d    3h      Coins mined: 23.203 ($0.00032). Level: patriot
-  j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
-```
+![main view](screenshots/sessions.svg)
 
 - `>` marks the selection.
 - `*` marks attached sessions.
 
 Press `v` to manage `shpool`'s template variables and their attached sessions.
 
-```
-                              variables (2)
- > coin   = djt   (1 session)
-   editor = vim   (1 session)
-  candidate values:
-   djt
- > xmr
-   xrp
-
-  {coin} attachments:
-    {coin}-miner             djt-miner        pid 4321  -> xmr-miner
-  set coin = xmr_   (ret: apply, esc: cancel)
-```
+![variables view](screenshots/variables.svg)
 
 ## Install
 
