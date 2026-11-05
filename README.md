@@ -9,11 +9,11 @@ A TUI for [`shpool`](https://github.com/shell-pool/shpool). Like [tdupes/shpiel]
 ## What it looks like (colors/highlighting in terminal)
 
 ```
-                           shpool (3 sessions)
-  name       created  active
-*>acme -nw   2h       now
-  stuxnet    2h       1m
-* djt-miner  1d       3h
+                             shpool (3 sessions)
+  name       created  active  title
+*>mail       5h       now     NeoMutt with 2481 messages [12 NEW]
+  vim        10m      4m      nvme0n1 (/dev) - VIM
+* djt-miner  1461d    3h      Coins mined: 23.203 ($0.00032). Level: patriot
   j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
 ```
 
@@ -25,7 +25,7 @@ Press `v` to manage `shpool`'s template variables and their attached sessions.
 ```
                               variables (2)
  > coin   = djt   (1 session)
-   editor = acme   (1 session)
+   editor = vim   (1 session)
   candidate values:
    djt
  > xmr

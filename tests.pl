@@ -1154,6 +1154,58 @@ subtest 'golden: session list (clock mocked)' => sub {
 GOLDEN
 };
 
+subtest 'golden: session list with window titles, clipped at the edge' => sub {
+    no warnings qw(redefine once);
+    local *main::now_unix_ms = sub { 1_000_000_000 };
+    my $m = main::model_new();
+    main::model_refresh($m, [
+        { name => 'web', status => 'Attached', attached => 1,
+          started_at_unix_ms => 992_800_000,
+          last_connected_at_unix_ms => 999_995_000,
+          last_disconnected_at_unix_ms => 0,
+          window_title => 'vim src/main.rs' },
+        { name => 'db', status => 'Disconnected', attached => 0,
+          started_at_unix_ms => 996_400_000,
+          last_connected_at_unix_ms => 996_400_000,
+          last_disconnected_at_unix_ms => 999_400_000,
+          window_title => undef },
+        { name => 'logs', status => 'Disconnected', attached => 0,
+          started_at_unix_ms => 996_400_000,
+          last_connected_at_unix_ms => 996_400_000,
+          last_disconnected_at_unix_ms => 990_000_000,
+          window_title => 'tail -f /var/log/a-very-long-path/that-runs-off.log' },
+    ]);
+    $m->{selected} = 0;
+    frame_is(main::render($m, 60, 8), <<'GOLDEN', 'title column frame');
+                    shpool (3 sessions)
+  name  created  active  title
+*>web   2h       5s      vim src/main.rs
+  db    1h       10m
+  logs  1h       1h      tail -f /var/log/a-very-long-path/t
+  j down   k up   spc attach   n new   d kill   D daemon   v
+GOLDEN
+};
+
+subtest 'display_title makes a window title safe to draw' => sub {
+    is(main::display_title(undef), undef, 'no title stays none');
+    is(main::display_title('vim'), 'vim', 'plain title unchanged');
+    is(main::display_title("caf\x{e9} \x{1F980}"), "caf\x{e9} \x{1F980}",
+        'non-ASCII printable kept');
+    is(main::display_title("a\e[2Jb"), 'a [2Jb', 'ESC removed, so no sequence reaches the terminal');
+    is(main::display_title("a\x{9b}2Jb"), 'a 2Jb', 'one-byte C1 CSI removed');
+    is(main::display_title("a\tb\r\nc\x7f"), 'a b c', 'control runs become one space, ends trimmed');
+    is(main::display_title("x\x{202E}yz"), 'x yz', 'bidi override removed');
+    is(main::display_title("\a\e"), undef, 'nothing printable left -> none');
+};
+
+subtest 'title column shows only when some session has a title' => sub {
+    ok(!main::title_column_shown([]), 'no sessions');
+    ok(!main::title_column_shown([ { name => 'a' }, { name => 'b', window_title => undef } ]),
+        'no titles reported');
+    ok(main::title_column_shown([ { name => 'a' }, { name => 'b', window_title => 'x' } ]),
+        'one title reported');
+};
+
 subtest 'golden: empty session list' => sub {
     my $m = main::model_new();
     frame_is(main::render($m, 76, 8), <<'GOLDEN', 'empty list frame');

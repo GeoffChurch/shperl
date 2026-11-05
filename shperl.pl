@@ -285,8 +285,23 @@ sub fetch_sessions {
     # be collapsed into "not attached".
     for my $s (@$sessions) {
         $s->{attached} = (($s->{status} // '') eq 'Attached') ? 1 : 0;
+        $s->{window_title} = display_title($s->{window_title});
     }
     return $sessions;
+}
+
+# A window title made safe to draw, or undef when nothing printable is
+# left. The title is whatever the session's programs sent, so control
+# characters (C0, DEL, C1 — including ESC and the one-byte CSI U+009B)
+# would let it drive the terminal from inside the table, and bidi
+# controls would let it reorder the row around it. Each run of them
+# becomes one space, so a tab or newline still separates words.
+sub display_title {
+    my $t = shift;
+    return undef unless defined $t;
+    $t =~ s/[\p{Cc}\p{Bidi_Control}]+/ /g;
+    $t =~ s/^ +| +$//g;
+    return length $t ? $t : undef;
 }
 
 # The daemon's template variables, via `shpool var list` (one
@@ -1499,8 +1514,19 @@ sub name_column_width {
     return $w;
 }
 
+my $COL_TITLE = 'title';
+
+# Whether the table has a title column: only when some session reports
+# a title, so a daemon or restore mode that reports none keeps the
+# table as it was. The column is last, since it is the one free-form
+# field, and takes whatever width is left before the clip.
+sub title_column_shown {
+    my $sessions = shift;
+    return scalar grep { defined $_->{window_title} } @$sessions;
+}
+
 sub header_row {
-    my ($w, $name_width) = @_;
+    my ($w, $name_width, $show_title) = @_;
     my $gap = ' ' x $COL_GAP;
     my $header = clip_plain(
         sprintf("  %-*s%s%-*s%s%-*s",
@@ -1508,7 +1534,8 @@ sub header_row {
             $gap,
             length($COL_CREATED),  $COL_CREATED,
             $gap,
-            length($COL_ACTIVE),   $COL_ACTIVE),
+            length($COL_ACTIVE),   $COL_ACTIVE)
+        . ($show_title ? $gap . $COL_TITLE : ''),
         $w,
     );
     return sprintf("%s%s%-*s%s\r\n",
@@ -1521,7 +1548,7 @@ sub header_row {
 # the pre-flight rejection), '>' for the highlighted row. ASCII so
 # we don't depend on the terminal's locale/font.
 sub session_row {
-    my ($s, $is_selected, $name_width, $now, $w) = @_;
+    my ($s, $is_selected, $name_width, $show_title, $now, $w) = @_;
     my $gap     = ' ' x $COL_GAP;
     my $dot     = $s->{attached} ? '*' : ' ';
     my $arrow   = $is_selected   ? '>' : ' ';
@@ -1534,7 +1561,8 @@ sub session_row {
             $gap,
             length($COL_CREATED),  $created,
             $gap,
-            length($COL_ACTIVE),   $active),
+            length($COL_ACTIVE),   $active)
+        . ($show_title ? $gap . ($s->{window_title} // '') : ''),
         $w,
     );
     return $is_selected
@@ -1565,7 +1593,8 @@ sub render {
     my $out = "\e[2J\e[H";                              # clear + home
     $out .= render_bar($w, title_label($m), 'center');
     my $name_width = name_column_width($m->{sessions});
-    $out .= header_row($w, $name_width);
+    my $show_title = title_column_shown($m->{sessions});
+    $out .= header_row($w, $name_width, $show_title);
     if (!@{$m->{sessions}}) {
         $out .= "  (no sessions)\r\n";
     } else {
@@ -1577,7 +1606,8 @@ sub render {
         for my $i ($start .. $end - 1) {
             my $is_selected = !$m->{stale_select} && $i == $m->{selected};
             $out .= session_row(
-                $m->{sessions}[$i], $is_selected, $name_width, $now, $w);
+                $m->{sessions}[$i], $is_selected, $name_width, $show_title,
+                $now, $w);
         }
     }
     $out .= render_bar($w, bottom_bar_label($m), 'left');
