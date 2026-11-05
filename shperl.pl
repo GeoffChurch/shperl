@@ -1451,7 +1451,7 @@ sub ms_until_age_changes {
 
 # Milliseconds until the soonest on-screen relative-age string would
 # change, or undef when there's nothing to tick (empty list). Drives the
-# select timeout so the "created"/"active" columns advance on their own
+# select timeout so the "created"/"attached" columns advance on their own
 # while the table is idle, without waking any more often than the
 # coarsest visible unit needs. Computed over every session — cheap, and
 # the youngest sets the cadence whether or not it's scrolled into view.
@@ -1484,7 +1484,7 @@ sub viewport {
 
 my $CHROME_LINES = 3;                 # top bar + header + bottom bar
 my $COL_CREATED  = 'created';
-my $COL_ACTIVE   = 'active';
+my $COL_ATTACHED = 'attached';
 my $COL_GAP      = 2;
 
 # Clip to $max columns. A wide character that would straddle the edge
@@ -1534,7 +1534,7 @@ sub header_row {
             $gap,
             length($COL_CREATED),  $COL_CREATED,
             $gap,
-            length($COL_ACTIVE),   $COL_ACTIVE)
+            length($COL_ATTACHED), $COL_ATTACHED)
         . ($show_title ? $gap . $COL_TITLE : ''),
         $w,
     );
@@ -1553,7 +1553,7 @@ sub session_row {
     my $dot     = $s->{attached} ? '*' : ' ';
     my $arrow   = $is_selected   ? '>' : ' ';
     my $created = format_age($now, $s->{started_at_unix_ms} // 0);
-    my $active  = format_age($now, last_touched_ms($s));
+    my $last_attached = format_age($now, last_touched_ms($s));
     my $text = clip_plain(
         sprintf("%s%s%s%s%-*s%s%-*s",
             $dot, $arrow,
@@ -1561,7 +1561,7 @@ sub session_row {
             $gap,
             length($COL_CREATED),  $created,
             $gap,
-            length($COL_ACTIVE),   $active)
+            length($COL_ATTACHED), $last_attached)
         . ($show_title ? $gap . ($s->{window_title} // '') : ''),
         $w,
     );

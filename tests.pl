@@ -1148,7 +1148,7 @@ subtest 'golden: session list (clock mocked)' => sub {
     $m->{selected} = 0;
     frame_is(main::render($m, 76, 8), <<'GOLDEN', 'session list frame');
                             shpool (2 sessions)
-  name  created  active
+  name  created  attached
 *>web   2h       5s
   db    1h       10m
   j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
@@ -1179,10 +1179,10 @@ subtest 'golden: session list with window titles, clipped at the edge' => sub {
     $m->{selected} = 0;
     frame_is(main::render($m, 60, 8), <<'GOLDEN', 'title column frame');
                     shpool (3 sessions)
-  name  created  active  title
-*>web   2h       5s      vim src/main.rs
+  name  created  attached  title
+*>web   2h       5s        vim src/main.rs
   db    1h       10m
-  logs  1h       1h      tail -f /var/log/a-very-long-path/t
+  logs  1h       1h        tail -f /var/log/a-very-long-path
   j down   k up   spc attach   n new   d kill   D daemon   v
 GOLDEN
 };
@@ -1227,7 +1227,7 @@ subtest 'golden: empty session list' => sub {
     my $m = main::model_new();
     frame_is(main::render($m, 76, 8), <<'GOLDEN', 'empty list frame');
                             shpool (0 sessions)
-  name  created  active
+  name  created  attached
   (no sessions)
   j down   k up   spc attach   n new   d kill   D daemon   v vars   q quit
 GOLDEN
